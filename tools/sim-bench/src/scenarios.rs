@@ -1,0 +1,808 @@
+use crate::report::BenchmarkResult;
+use game_types::{FactionId, RegionId, SimTick};
+use sim_core::entity::Entity;
+use sim_core::message_queue::{BackpressurePolicy, CrossRegionPayload};
+use sim_core::region::{Region, RegionBounds, RegionState};
+use sim_core::scheduler::WakeupReason;
+use sim_core::test_harness::TestHarness;
+use std::time::Instant;
+
+fn estimate_memory(entity_count: usize, region_count: usize, queue_msgs: usize) -> usize {
+    let entity_size = std::mem::size_of::<Entity>() + 48; // struct + BTreeSet node overhead
+    let region_size = std::mem::size_of::<Region>() + 64;
+    let msg_size = 64;
+    (entity_count * entity_size) + (region_count * region_size) + (queue_msgs * msg_size) + 16384
+}
+
+/// Scenario 1: 10,000 inert static structures (walls) in cold regions.
+pub fn scenario_10k_walls() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_walls = 10_000;
+    let num_regions = 16;
+    let ticks_to_run = 60; // 2 seconds of 30 Hz simulation
+
+    // Setup 16 cold regions in a 4x4 grid
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 250.0,
+            row * 250.0,
+            (col + 1.0) * 250.0,
+            (row + 1.0) * 250.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Cold))
+            .unwrap();
+    }
+
+    // Distribute 10,000 wall entities evenly across cold regions and compact wall grid with mixed tiers
+    for i in 0..num_walls {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        harness.create_entity(FactionId::new(1), reg_id);
+        let gx = (i % 100) as i32;
+        let gz = (i / 100) as i32;
+        let tier = ((i % 3) + 1) as u8; // Mixed Mk1, Mk2, Mk3 tiers
+        harness
+            .state_mut()
+            .structure_registry
+            .wall_grid
+            .insert_wall(gx, gz, tier, FactionId::new(1));
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "10k_walls".to_string(),
+        description: "10,000 inert walls in 16 cold regions".to_string(),
+        entity_count: num_walls,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_walls, num_regions, 0),
+    }
+}
+
+/// Scenario 2: 1,000 idle units across warm and cold regions.
+pub fn scenario_1k_idle_units() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_units = 1_000;
+    let num_regions = 8;
+    let ticks_to_run = 120; // 4 seconds at 30 Hz
+
+    // 4 Warm regions and 4 Cold regions
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let state = if r <= 4 {
+            RegionState::Warm
+        } else {
+            RegionState::Cold
+        };
+        let bounds =
+            RegionBounds::new((r as f32) * 100.0, 0.0, ((r + 1) as f32) * 100.0, 100.0).unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, state))
+            .unwrap();
+    }
+
+    for i in 0..num_units {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        harness.create_entity(FactionId::new(1), reg_id);
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "1k_idle_units".to_string(),
+        description: "1,000 idle units split across 4 warm and 4 cold regions".to_string(),
+        entity_count: num_units,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_units, num_regions, 0),
+    }
+}
+
+/// Scenario 3: Hot vs Cold regions comparison with identical entity counts.
+pub fn scenario_hot_vs_cold() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let entities_per_region = 500;
+    let num_entities = entities_per_region * 2;
+    let ticks_to_run = 120; // 4 seconds at 30 Hz
+
+    let reg_hot = RegionId::new(1);
+    let reg_cold = RegionId::new(2);
+
+    harness
+        .state_mut()
+        .region_map
+        .add_region(Region::new(
+            reg_hot,
+            RegionBounds::new(0.0, 0.0, 500.0, 500.0).unwrap(),
+            RegionState::Hot,
+        ))
+        .unwrap();
+
+    harness
+        .state_mut()
+        .region_map
+        .add_region(Region::new(
+            reg_cold,
+            RegionBounds::new(500.0, 0.0, 1000.0, 500.0).unwrap(),
+            RegionState::Cold,
+        ))
+        .unwrap();
+
+    for _ in 0..entities_per_region {
+        harness.create_entity(FactionId::new(1), reg_hot);
+        harness.create_entity(FactionId::new(1), reg_cold);
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "hot_vs_cold".to_string(),
+        description: "500 entities in Hot vs 500 entities in Cold region".to_string(),
+        entity_count: num_entities,
+        region_count: 2,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_entities, 2, 0),
+    }
+}
+
+/// Scenario 4: Scheduled factories in cold regions waking up periodically.
+pub fn scenario_scheduled_factories() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_factories = 200;
+    let ticks_to_run = 150; // 5 seconds at 30 Hz
+
+    let reg_factory = RegionId::new(10);
+    harness
+        .state_mut()
+        .region_map
+        .add_region(Region::new(
+            reg_factory,
+            RegionBounds::new(0.0, 0.0, 1000.0, 1000.0).unwrap(),
+            RegionState::Cold,
+        ))
+        .unwrap();
+
+    for _ in 0..num_factories {
+        harness.create_entity(FactionId::new(1), reg_factory);
+    }
+
+    // Schedule production wakeups every 30 ticks (at tick 30, 60, 90, 120, 150)
+    for cycle in 1..=5 {
+        let tick = SimTick::new(cycle * 30);
+        harness
+            .state_mut()
+            .scheduler
+            .schedule_wakeup(tick, reg_factory, WakeupReason::PeriodicTimer)
+            .unwrap();
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "scheduled_factories".to_string(),
+        description: "200 factories waking up every 30 ticks in cold region".to_string(),
+        entity_count: num_factories,
+        region_count: 1,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_factories, 1, 0),
+    }
+}
+
+/// Scenario 5: High-volume cross-region message routing under backpressure.
+pub fn scenario_event_queue_stress() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_regions = 16;
+    let total_messages = 25_000;
+    let ticks_to_run = 30; // 1 second
+
+    // Configure 16 regions (half Hot, half Cold) with high queue capacity and DropOldest backpressure
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let state = if r % 2 == 0 {
+            RegionState::Hot
+        } else {
+            RegionState::Cold
+        };
+        let bounds =
+            RegionBounds::new((r as f32) * 50.0, 0.0, ((r + 1) as f32) * 50.0, 50.0).unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, state))
+            .unwrap();
+
+        harness.state_mut().router.set_region_queue_policy(
+            reg_id,
+            2048,
+            BackpressurePolicy::DropOldest,
+        );
+
+        // Add 10 entities per region
+        for _ in 0..10 {
+            harness.create_entity(FactionId::new(1), reg_id);
+        }
+    }
+
+    let start = Instant::now();
+
+    // Pump 25,000 cross-region messages across the 30 ticks
+    let msgs_per_tick = total_messages / (ticks_to_run as usize);
+    for t in 1..=ticks_to_run {
+        let current_tick = SimTick::new(t);
+        for m in 0..msgs_per_tick {
+            let from = RegionId::new(((m % num_regions) + 1) as u32);
+            let to = RegionId::new((((m + 1) % num_regions) + 1) as u32);
+            let _ = harness.state_mut().router.send(
+                from,
+                to,
+                current_tick,
+                CrossRegionPayload::Signal {
+                    signal_id: m as u32,
+                    data: current_tick.value(),
+                },
+            );
+        }
+        harness.step_tick();
+    }
+
+    let elapsed = start.elapsed();
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "event_queue_stress".to_string(),
+        description: "25,000 cross-region messages routed across 16 regions".to_string(),
+        entity_count: num_regions * 10,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_regions * 10, num_regions, total_messages),
+    }
+}
+
+/// Scenario 6: 1,000 power network structures (generators, pylons, batteries, turrets, fabricators) across multi-island grids.
+pub fn scenario_power_grid_1k() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_structures = 1_000;
+    let num_regions = 16;
+    let ticks_to_run = 60; // 2 seconds of 30 Hz simulation
+
+    // Setup 16 regions
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 250.0,
+            row * 250.0,
+            (col + 1.0) * 250.0,
+            (row + 1.0) * 250.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Hot))
+            .unwrap();
+    }
+
+    // Place 1,000 structures in a distributed power network
+    for i in 0..num_structures {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let col = (i % 25) as f32 * 10.0;
+        let row = (i / 25) as f32 * 10.0;
+        let pos = (col, 0.0, row);
+
+        let kind = match i % 10 {
+            0 => sim_core::structure::StructureKind::Generator,
+            1..=4 => sim_core::structure::StructureKind::Pylon,
+            5..=7 => sim_core::structure::StructureKind::Turret,
+            8 => sim_core::structure::StructureKind::Fabricator,
+            _ => sim_core::structure::StructureKind::Battery,
+        };
+
+        let id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(
+                sim_core::structure::BuildRequest {
+                    player_pos: pos,
+                    requested_pos: pos,
+                    kind,
+                    rotation_deg: 0.0,
+                    faction_id: FactionId::new(1),
+                    region_id: reg_id,
+                    creation_tick: SimTick::zero(),
+                    world_bounds_xz: (-1000.0, 1000.0, -1000.0, 1000.0),
+                },
+                None,
+            )
+            .unwrap();
+
+        harness
+            .state_mut()
+            .structure_registry
+            .complete_construction(id)
+            .unwrap();
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "power_grid_1k".to_string(),
+        description: "1,000 power structures across multi-island grids with battery buffering"
+            .to_string(),
+        entity_count: num_structures,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
+    }
+}
+
+/// Scenario 7: 1,000 industrial production structures (miners, refineries, fabricators, generators).
+pub fn scenario_production_chain_1k() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_structures = 1_000;
+    let num_regions = 16;
+    let ticks_to_run = 60;
+
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 500.0,
+            row * 500.0,
+            (col + 1.0) * 500.0,
+            (row + 1.0) * 500.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Hot))
+            .unwrap();
+    }
+
+    // Register 100 deposits
+    for d in 1..=100 {
+        let dep_id = game_types::DepositId::new(d as u64);
+        let res_id = if d % 2 == 0 {
+            game_types::RES_IRON_ORE
+        } else {
+            game_types::RES_TUNGSTEN_ORE
+        };
+        harness.state_mut().structure_registry.register_deposit(
+            sim_core::production::ResourceDeposit::new(
+                dep_id,
+                res_id,
+                ((d % 10) as f32 * 50.0, 0.0, (d / 10) as f32 * 50.0),
+                100_000,
+                1.0,
+            ),
+        );
+    }
+
+    for i in 0..num_structures {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let col = (i % 25) as f32 * 15.0;
+        let row = (i / 25) as f32 * 15.0;
+        let pos = (col, 0.0, row);
+
+        let kind = match i % 5 {
+            0 => sim_core::structure::StructureKind::Generator,
+            1 => sim_core::structure::StructureKind::MiningDrill,
+            2 => sim_core::structure::StructureKind::Refinery,
+            3 => sim_core::structure::StructureKind::Fabricator,
+            _ => sim_core::structure::StructureKind::Pylon,
+        };
+
+        let id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(
+                sim_core::structure::BuildRequest {
+                    player_pos: pos,
+                    requested_pos: pos,
+                    kind,
+                    rotation_deg: 0.0,
+                    faction_id: FactionId::new(1),
+                    region_id: reg_id,
+                    creation_tick: SimTick::zero(),
+                    world_bounds_xz: (-2000.0, 2000.0, -2000.0, 2000.0),
+                },
+                None,
+            )
+            .unwrap();
+
+        harness
+            .state_mut()
+            .structure_registry
+            .complete_construction(id)
+            .unwrap();
+
+        // Configure facility tasks and initial inputs
+        if let Some(fac) = harness.state_mut().structure_registry.get_facility_mut(id) {
+            match fac.kind {
+                sim_core::production::FacilityKind::MiningDrill => {
+                    let dep_id = game_types::DepositId::new(((i % 100) + 1) as u64);
+                    fac.set_deposit(dep_id);
+                }
+                sim_core::production::FacilityKind::Refinery => {
+                    fac.set_recipe(sim_core::production::RECIPE_SMELT_STEEL)
+                        .unwrap();
+                    let _ = fac.input_inventory.add(game_types::RES_IRON_ORE, 500);
+                }
+                sim_core::production::FacilityKind::Fabricator => {
+                    fac.set_recipe(sim_core::production::RECIPE_FABRICATE_BASIC_COMPONENTS)
+                        .unwrap();
+                    let _ = fac.input_inventory.add(game_types::RES_STEEL, 500);
+                }
+            }
+        }
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "production_chain_1k".to_string(),
+        description:
+            "1,000 industrial facilities (miners, refineries, fabricators) executing concurrent production cycles"
+                .to_string(),
+        entity_count: num_structures,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
+    }
+}
+
+/// Scenario 8: 1,000 concurrent logistics jobs across 16 regions with depots, docks, and route graph.
+pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_jobs = 1000;
+    let num_regions = 16;
+    let num_depots = 100;
+    let num_haulers = 250;
+    let ticks_to_run = 60; // 2 seconds of 30 Hz simulation
+
+    // Setup 16 regions in 4x4 grid
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 250.0,
+            row * 250.0,
+            (col + 1.0) * 250.0,
+            (row + 1.0) * 250.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Hot))
+            .unwrap();
+    }
+
+    // Setup 100 depots with inventories and docks
+    let mut depot_entities = Vec::with_capacity(num_depots);
+    for i in 0..num_depots {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let ent = harness.create_entity(FactionId::new(1), reg_id);
+        depot_entities.push(ent);
+
+        let mut inv =
+            sim_core::inventory::Inventory::new(ent, sim_core::inventory::ContainerKind::Depot);
+        let _ = inv.add(game_types::RES_IRON_ORE, 10_000);
+        let _ = inv.add(game_types::RES_STEEL, 10_000);
+        harness.state_mut().inventory_registry.register(inv);
+
+        let dock = sim_core::logistics::LogisticsDock::new(ent, 4, 25);
+        harness
+            .state_mut()
+            .structure_registry
+            .logistics
+            .register_dock(dock);
+        let depot_logistics = sim_core::logistics::DepotLogistics::new(ent, 50.0);
+        harness
+            .state_mut()
+            .structure_registry
+            .logistics
+            .register_depot(depot_logistics);
+
+        // Add to route graph
+        let gx = ((i % 10) as f32) * 100.0;
+        let gz = ((i / 10) as f32) * 100.0;
+        harness
+            .state_mut()
+            .structure_registry
+            .logistics
+            .route_graph
+            .add_node(sim_core::logistics::RouteNode {
+                id: game_types::RouteNodeId::new((i + 1) as u32),
+                position: (gx, 0.0, gz),
+                associated_entity: Some(ent),
+            });
+    }
+
+    // Connect adjacent route graph nodes
+    for i in 0..num_depots {
+        let curr = game_types::RouteNodeId::new((i + 1) as u32);
+        if (i % 10) < 9 {
+            let next_e = game_types::RouteNodeId::new((i + 2) as u32);
+            harness
+                .state_mut()
+                .structure_registry
+                .logistics
+                .route_graph
+                .add_edge(sim_core::logistics::RouteEdge {
+                    from: curr,
+                    to: next_e,
+                    distance: 100.0,
+                    max_active_haulers: 8,
+                    current_haulers: 0,
+                    traversal_speed: 1.0,
+                });
+        }
+    }
+
+    // Create 250 mobile hauler entities with buffers
+    let mut hauler_entities = Vec::with_capacity(num_haulers);
+    for i in 0..num_haulers {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let hauler = harness.create_entity(FactionId::new(1), reg_id);
+        hauler_entities.push(hauler);
+        harness
+            .state_mut()
+            .inventory_registry
+            .register(sim_core::inventory::Inventory::new(
+                hauler,
+                sim_core::inventory::ContainerKind::CargoBuffer,
+            ));
+    }
+
+    // Submit 1,000 logistics jobs with mixed priorities
+    let mut job_ids = Vec::with_capacity(num_jobs);
+    for i in 0..num_jobs {
+        let src = depot_entities[i % num_depots];
+        let dst = depot_entities[(i + 17) % num_depots];
+        let priority = match i % 4 {
+            0 => sim_core::logistics::JobPriority::Critical,
+            1 => sim_core::logistics::JobPriority::High,
+            2 => sim_core::logistics::JobPriority::Normal,
+            _ => sim_core::logistics::JobPriority::Low,
+        };
+        let res = if i % 2 == 0 {
+            game_types::RES_IRON_ORE
+        } else {
+            game_types::RES_STEEL
+        };
+
+        let jid = harness
+            .create_logistics_job(src, dst, res, 25, priority)
+            .unwrap();
+        job_ids.push(jid);
+    }
+
+    // Initial assignment of the first 250 jobs to haulers
+    for (idx, &hauler) in hauler_entities.iter().enumerate() {
+        let jid = job_ids[idx];
+        let _ = harness.claim_logistics_job(jid, hauler);
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "logistics_jobs_1k".to_string(),
+        description:
+            "1,000 concurrent logistics jobs across 16 regions with 100 depots, docks, and 250 haulers"
+                .to_string(),
+        entity_count: num_jobs + num_depots + num_haulers,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_jobs + num_depots + num_haulers, num_regions, 0),
+    }
+}

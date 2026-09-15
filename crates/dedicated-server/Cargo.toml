@@ -1,0 +1,13 @@
+[package]
+name = "dedicated-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dedicated-server"
+path = "src/main.rs"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+game-types = { path = "../game-types" }
+game-protocol = { path = "../game-protocol" }

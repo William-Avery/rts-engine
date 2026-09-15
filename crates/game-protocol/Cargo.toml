@@ -1,0 +1,8 @@
+[package]
+name = "game-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+game-types = { path = "../game-types" }
+sim-core = { path = "../sim-core" }

@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/game-types",
+    "crates/sim-core",
+    "crates/game-protocol",
+    "crates/dedicated-server",
+    "crates/game-client",
+    "tools/sim-bench",
+]
+resolver = "2"
