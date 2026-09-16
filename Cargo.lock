@@ -24,6 +24,7 @@ dependencies = [
 name = "game-client"
 version = "0.1.0"
 dependencies = [
+ "anti-cheat",
  "game-protocol",
  "game-types",
  "sim-core",

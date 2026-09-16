@@ -1,16 +1,20 @@
 use crate::avatar::Avatar;
-use crate::camera::ThirdPersonCamera;
+use crate::camera::{CameraMode, ThirdPersonCamera};
+use crate::fog_view::FogViewSnapshot;
 use crate::hud::DebugHud;
 use crate::input::InputState;
 use crate::interaction::camera_interaction_ray;
 use crate::interpolation::{EntitySample, InterpolationBuffer};
 use crate::logistics_view::LogisticsViewSnapshot;
 use crate::placement::PlacementGhost;
+use crate::power_view::PowerViewSnapshot;
 use crate::prediction::{MovementInputSnapshot, PlayerState, PredictedController};
-use game_types::{EntityId, RegionId, SimTick, StructureId};
+use crate::selection::TacticalSelection;
+use game_types::{EntityId, FactionId, RegionId, SimTick, StructureId};
 use sim_core::command::Command;
 use sim_core::structure::{StructureKind, StructureRegistry, StructureState};
 use sim_core::terrain::GreyboxTerrain;
+use sim_core::world::WorldState;
 use std::collections::BTreeMap;
 
 /// Presentation representation of a world structure.
@@ -22,23 +26,49 @@ pub struct StructureRenderView {
     pub state: StructureState,
 }
 
+/// Active visual overlay layers for strategic and tactical modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OverlayFlags {
+    pub show_sensor_coverage: bool,
+    pub show_power_grid: bool,
+    pub show_logistics_network: bool,
+    pub show_production_summary: bool,
+}
+
+/// Macro summary of industrial manufacturing and refining throughput.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProductionSummaryTelemetry {
+    pub active_facilities: usize,
+    pub operational_facilities: usize,
+    pub total_cycles_completed: u64,
+    pub starved_facilities: usize,
+}
+
 /// Snapshot of the complete presentation frame ready for rendering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PresentationFrame {
     pub camera_eye: (f32, f32, f32),
     pub camera_focus: (f32, f32, f32),
     pub camera_forward: (f32, f32, f32),
+    pub camera_mode: CameraMode,
+    pub is_transitioning: bool,
+    pub transition_progress: f32,
     pub player_position: (f32, f32, f32),
     pub player_facing_yaw: f32,
     pub player_locomotion: crate::avatar::LocomotionState,
     pub remote_entities: Vec<(EntityId, (f32, f32, f32))>,
+    pub selection: TacticalSelection,
     pub placement_ghost: Option<PlacementGhost>,
     pub structures: Vec<StructureRenderView>,
+    pub power_overlay: Option<PowerViewSnapshot>,
+    pub logistics_overlay: Option<LogisticsViewSnapshot>,
+    pub production_summary: Option<ProductionSummaryTelemetry>,
     pub hud_summary: String,
 }
 
 /// High-level client presentation coordinator uniting camera, input, predicted movement,
-/// terrain collision, avatar representation, remote entity interpolation, building placement, and debug HUD.
+/// terrain collision, avatar representation, remote entity interpolation, building placement,
+/// tactical unit selection, and strategic overlays.
 #[derive(Debug, Clone)]
 pub struct ClientPresentation {
     pub camera: ThirdPersonCamera,
@@ -50,6 +80,9 @@ pub struct ClientPresentation {
     pub remote_entities: BTreeMap<EntityId, InterpolationBuffer>,
     pub structure_registry: StructureRegistry,
     pub placement_ghost: PlacementGhost,
+    pub selection: TacticalSelection,
+    pub overlay_flags: OverlayFlags,
+    pub faction_id: FactionId,
     pub next_input_seq: u64,
     pub client_tick: SimTick,
     pub mouse_sensitivity: f32,
@@ -67,6 +100,9 @@ impl Default for ClientPresentation {
             remote_entities: BTreeMap::new(),
             structure_registry: StructureRegistry::default(),
             placement_ghost: PlacementGhost::default(),
+            selection: TacticalSelection::default(),
+            overlay_flags: OverlayFlags::default(),
+            faction_id: FactionId::new(1),
             next_input_seq: 1,
             client_tick: SimTick::zero(),
             mouse_sensitivity: 0.003,
@@ -83,7 +119,10 @@ impl ClientPresentation {
     pub fn update(&mut self, dt: f32, current_time_ms: u64) -> PresentationFrame {
         self.client_tick = self.client_tick.next();
 
-        // 1. Process mouse look orbit & zoom
+        // 1. Process camera mode transitions
+        self.camera.update_transition(dt);
+
+        // 2. Process mouse look orbit & zoom
         if self.input.mouse_delta_x.abs() > 0.001 || self.input.mouse_delta_y.abs() > 0.001 {
             let delta_yaw = self.input.mouse_delta_x * self.mouse_sensitivity;
             let delta_pitch = -self.input.mouse_delta_y * self.mouse_sensitivity;
@@ -93,12 +132,12 @@ impl ClientPresentation {
             self.camera.zoom(-self.input.zoom_delta * 1.5);
         }
 
-        // 2. Compute camera-relative world movement direction
+        // 3. Compute camera-relative world movement direction
         let move_dir = self
             .input
             .compute_planar_movement_direction(self.camera.yaw);
 
-        // 3. Generate input snapshot and step local prediction
+        // 4. Generate input snapshot and step local prediction for avatar
         let seq = self.next_input_seq;
         self.next_input_seq += 1;
 
@@ -109,17 +148,19 @@ impl ClientPresentation {
             .controller
             .step_prediction(input_snapshot, &self.terrain);
 
-        // 4. Update avatar visual and animation state
+        // 5. Update avatar visual and animation state
         self.avatar
             .update(predicted_state.velocity, predicted_state.grounded, dt);
 
-        // 5. Update camera focus to follow predicted avatar position
-        self.camera.set_target(predicted_state.position);
+        // 6. Update camera focus: follow avatar in ThirdPerson; preserve free pan in Tactical/Strategic
+        if self.camera.mode == CameraMode::ThirdPerson && !self.camera.is_transitioning() {
+            self.camera.set_target(predicted_state.position);
+        }
 
-        // 6. Reset transient input deltas
+        // 7. Reset transient input deltas
         self.input.reset_frame_deltas();
 
-        // 7. Update interactive placement ghost if active
+        // 8. Update interactive placement ghost if active
         if self.placement_ghost.active {
             let ray = camera_interaction_ray(&self.camera, 0.0, 0.0);
             if let Some(ground_pt) = ray.intersect_ground(self.terrain.ground_y) {
@@ -132,7 +173,7 @@ impl ClientPresentation {
             }
         }
 
-        // 8. Update HUD telemetry
+        // 9. Update HUD telemetry
         self.hud.update_telemetry(crate::hud::TelemetrySnapshot {
             ping_ms: self.hud.ping_ms,
             server_tick: self.hud.server_tick,
@@ -143,9 +184,21 @@ impl ClientPresentation {
             reconciliation_count: self.controller.reconciliation_count,
             active_entity_count: self.remote_entities.len(),
         });
+        self.hud.camera_mode = self.camera.mode();
+        self.hud.selected_units_count = self.selection.len();
 
-        // 9. Produce presentation frame
+        // 10. Produce presentation frame
         self.build_frame(current_time_ms)
+    }
+
+    /// Set camera mode with smooth transition over `duration_sec`.
+    pub fn set_camera_mode(&mut self, mode: CameraMode, duration_sec: f32) {
+        self.camera.set_mode(mode, duration_sec);
+    }
+
+    /// Pan camera across ground plane (Tactical or Strategic mode).
+    pub fn pan_camera(&mut self, delta_right: f32, delta_forward: f32) {
+        self.camera.pan(delta_right, delta_forward);
     }
 
     /// Activate placement ghost for a structure kind.
@@ -166,6 +219,26 @@ impl ClientPresentation {
     /// Generates authoritative build command if placement ghost is currently valid.
     pub fn create_build_command(&self) -> Option<Command> {
         self.placement_ghost.create_build_command()
+    }
+
+    /// Select units using 2D screen marquee drag box.
+    pub fn select_marquee(
+        &mut self,
+        candidates: &[(EntityId, (f32, f32, f32))],
+        shift_append: bool,
+    ) -> usize {
+        self.selection
+            .complete_marquee(&self.camera, candidates, shift_append)
+    }
+
+    /// Issue tactical move order for currently selected units.
+    pub fn issue_tactical_move(&self, target_pos: (f32, f32, f32)) -> Vec<Command> {
+        self.selection.issue_move_order(target_pos)
+    }
+
+    /// Issue tactical attack order for currently selected units.
+    pub fn issue_tactical_attack(&self, target_entity: EntityId) -> Vec<Command> {
+        self.selection.issue_attack_order(target_entity)
     }
 
     /// Ingests authoritative player state from server snapshot, reconciling prediction.
@@ -230,26 +303,88 @@ impl ClientPresentation {
             })
             .collect();
 
+        let power_overlay = if self.overlay_flags.show_power_grid {
+            Some(self.extract_power_snapshot())
+        } else {
+            None
+        };
+
+        let logistics_overlay = if self.overlay_flags.show_logistics_network {
+            Some(self.extract_logistics_snapshot())
+        } else {
+            None
+        };
+
+        let production_summary = if self.overlay_flags.show_production_summary {
+            Some(self.extract_production_summary())
+        } else {
+            None
+        };
+
         PresentationFrame {
             camera_eye: self.camera.eye_position(),
             camera_focus: self.camera.focus_position(),
             camera_forward: self.camera.forward_vector(),
+            camera_mode: self.camera.mode(),
+            is_transitioning: self.camera.is_transitioning(),
+            transition_progress: self.camera.transition_progress(),
             player_position: self.controller.predicted_state.position,
             player_facing_yaw: self.avatar.facing_yaw,
             player_locomotion: self.avatar.locomotion_state,
             remote_entities: remote_positions,
+            selection: self.selection.clone(),
             placement_ghost: if self.placement_ghost.active {
                 Some(self.placement_ghost.clone())
             } else {
                 None
             },
             structures,
+            power_overlay,
+            logistics_overlay,
+            production_summary,
             hud_summary: self.hud.render_compact(),
         }
+    }
+
+    /// Extract power network diagnostic overlay snapshot
+    pub fn extract_power_snapshot(&self) -> PowerViewSnapshot {
+        PowerViewSnapshot::extract(
+            &self.structure_registry.power_network,
+            &self.structure_registry,
+            self.faction_id,
+        )
     }
 
     /// Extract logistics diagnostic overlay snapshot
     pub fn extract_logistics_snapshot(&self) -> LogisticsViewSnapshot {
         LogisticsViewSnapshot::extract(&self.structure_registry.logistics, &self.structure_registry)
+    }
+
+    /// Extract production telemetry summary
+    pub fn extract_production_summary(&self) -> ProductionSummaryTelemetry {
+        let active_facilities = self.structure_registry.facilities.len();
+        let mut operational = 0;
+        for id in self.structure_registry.facilities.keys() {
+            if self
+                .structure_registry
+                .structures
+                .get(id)
+                .is_some_and(|s| s.state.is_operational())
+            {
+                operational += 1;
+            }
+        }
+
+        ProductionSummaryTelemetry {
+            active_facilities,
+            operational_facilities: operational,
+            total_cycles_completed: 0,
+            starved_facilities: 0,
+        }
+    }
+
+    /// Extract fog view snapshot given world state
+    pub fn extract_fog_snapshot(&self, world: &WorldState) -> FogViewSnapshot {
+        FogViewSnapshot::extract(world, self.faction_id)
     }
 }

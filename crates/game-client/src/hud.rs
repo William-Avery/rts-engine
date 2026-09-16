@@ -33,6 +33,8 @@ pub struct DebugHud {
     pub research_queue_depth: usize,
     pub research_active_progress: f32,
     pub research_active_modifiers: usize,
+    pub camera_mode: crate::camera::CameraMode,
+    pub selected_units_count: usize,
 }
 
 impl Default for DebugHud {
@@ -68,6 +70,8 @@ impl Default for DebugHud {
             research_queue_depth: 0,
             research_active_progress: 0.0,
             research_active_modifiers: 0,
+            camera_mode: crate::camera::CameraMode::ThirdPerson,
+            selected_units_count: 0,
         }
     }
 }
@@ -145,7 +149,8 @@ impl DebugHud {
     /// Renders a single-line summary of vital telemetry.
     pub fn render_compact(&self) -> String {
         format!(
-            "Ping: {}ms | SrvTick: {} | CliTick: {} | Reg: {} | Pred: ({:.2}, {:.2}, {:.2}) | Err: {:.3}m | Reconciles: {}",
+            "[{}] Ping: {}ms | SrvTick: {} | CliTick: {} | Reg: {} | Pred: ({:.2}, {:.2}, {:.2}) | Err: {:.3}m | Reconciles: {} | Sel: {}",
+            self.camera_mode.as_str(),
             self.ping_ms,
             self.server_tick.value(),
             self.client_tick.value(),
@@ -155,6 +160,7 @@ impl DebugHud {
             self.predicted_pos.2,
             self.error_distance,
             self.reconciliation_count,
+            self.selected_units_count,
         )
     }
 
@@ -177,6 +183,11 @@ impl DebugHud {
             "| Active Region ID:   {:>8}        Estimated FPS:     {:>7.1} |\n",
             self.region_id.value(),
             self.fps
+        ));
+        out.push_str(&format!(
+            "| Camera Perspective: {:>12}        Selected Units:    {:>7} |\n",
+            self.camera_mode.as_str(),
+            self.selected_units_count
         ));
         out.push_str("+--------------------------------------------------------------+\n");
         out.push_str(&format!(

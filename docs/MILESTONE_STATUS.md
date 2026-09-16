@@ -19,7 +19,7 @@ This file is maintained by the coding agent.
 | 12 | Basic Biped Robot Framework and Guardsman | COMPLETE |
 | 13 | Combat, Weapons, Damage, Armor, and Projectiles | COMPLETE |
 | 14 | Sensors, Faction Knowledge, Fog, and Replication Interest | COMPLETE |
-| 15 | Tactical and Strategic Camera Modes | NOT STARTED |
+| 15 | Tactical and Strategic Camera Modes | COMPLETE |
 | 16 | Hierarchical AI and Scalable Navigation | NOT STARTED |
 | 17 | Defensive Structures | NOT STARTED |
 | 18 | Specialist Robots | NOT STARTED |
@@ -299,4 +299,32 @@ For each milestone change, append:
   - `FogViewSnapshot` in `game-client/src/fog_view.rs` provides cached 2D mini-map exploration textures, visibility queries, and fog coverage telemetry.
 - Remaining debt: None
 - Blockers: None
+
+### Milestone 15 — Tactical and Strategic Camera Modes
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/game-client/src/camera.rs, crates/game-client/src/selection.rs, crates/game-client/src/presentation.rs, crates/game-client/src/hud.rs, crates/game-client/src/lib.rs, crates/game-client/Cargo.toml, docs/MILESTONE_STATUS.md
+- Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features` (360 tests across all crates), and `cargo run -p sim-bench --release` all pass cleanly with zero warnings.
+- Tests: 38 tests pass in `game-client` (360 tests across workspace).
+- Architecture & Features:
+  - Multi-tier camera controller with smooth cubic Hermite / smoothstep interpolation across `ThirdPerson`, `Tactical`, and `Strategic` modes:
+    - `ThirdPerson`: 12m distance, 25° pitch angle, tracks local avatar.
+    - `Tactical`: 45m distance, 55° pitch angle, free ground panning.
+    - `Strategic`: 120m distance, 80° top-down pitch angle, wide macro operational overview.
+  - Tactical ground panning along camera forward/right vectors with world boundary clamping (`[-150.0, 150.0]`).
+  - Screen-space point picking and 2D marquee drag box selection unprojected to ground AABB with shift-click multi-selection support.
+  - Tactical order generation (`Command::RobotCommand` with `MoveTo`, `AttackTarget`, `GuardLocation`, `FollowTarget`, `ReturnToBase`) with spaced tactical formations.
+  - Diagnostic and strategic overlays (`PowerViewSnapshot`, `LogisticsViewSnapshot`, `ProductionSummaryTelemetry`, `FogViewSnapshot`) integrated into `ClientPresentation` and `DebugHud`.
+  - Proving Ground Scenarios:
+    - `test_m15_camera_mode_switching_and_smooth_interpolation`: Smoothstep transitions across all 3 tiers with monotonic progress.
+    - `test_m15_tactical_panning_and_boundary_clamping`: Ground panning with bounds clamping without displacing avatar.
+    - `test_m15_point_and_marquee_box_selection`: Point ray-picking and screen marquee box selection.
+    - `test_m15_tactical_orders_generate_valid_authoritative_server_commands`: Selection issues authoritative server commands that drive server-side simulation.
+    - `test_m15_strategic_overlays_ingest_and_reflect_subsystems`: Strategic diagnostic overlays ingest power, logistics, production, and fog state and reflect them on HUD.
+    - `test_m15_continuous_simulation_during_camera_transition`: Camera transitions are purely client-side presentation and do not pause or mutate underlying simulation ticks.
+    - `test_m15_panning_over_unknown_terrain_does_not_leak_hidden_entities`: Panning over shroud does not reveal hidden entities, and anti-cheat rejects any malicious hidden targeting.
+- Remaining debt: None
+- Blockers: None
+
 

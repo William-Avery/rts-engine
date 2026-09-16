@@ -12,6 +12,7 @@ pub mod prediction;
 pub mod presentation;
 pub mod research_view;
 pub mod robot_view;
+pub mod selection;
 pub mod wall_batch;
 
 pub use avatar::*;
@@ -28,6 +29,7 @@ pub use prediction::*;
 pub use presentation::*;
 pub use research_view::*;
 pub use robot_view::*;
+pub use selection::*;
 pub use wall_batch::*;
 
 /// The authoritative collision world and movement validator live in `sim-core`.
@@ -673,5 +675,364 @@ mod tests {
         let out = hud.render_ascii_card();
         assert!(out.contains("Research:"));
         assert!(out.contains("Active Software Patches"));
+    }
+
+    // =========================================================================
+    // Milestone 15 — Tactical and Strategic Camera Modes Proving Grounds
+    // =========================================================================
+
+    /// M15 Proving Ground 1: Camera mode transitions smoothly between ThirdPerson, Tactical, and Strategic.
+    #[test]
+    fn test_m15_camera_mode_switching_and_smooth_interpolation() {
+        let mut client = ClientPresentation::new();
+        assert_eq!(client.camera.mode(), CameraMode::ThirdPerson);
+        assert!(!client.camera.is_transitioning());
+
+        // Initiate transition to Tactical mode over 0.5s
+        client.set_camera_mode(CameraMode::Tactical, 0.5);
+        assert!(client.camera.is_transitioning());
+        assert_eq!(client.camera.transition_progress(), 0.0);
+
+        // Step halfway (0.25s)
+        let frame_mid = client.update(0.25, 250);
+        assert!(frame_mid.is_transitioning);
+        assert!(frame_mid.transition_progress > 0.4 && frame_mid.transition_progress < 0.6);
+        assert!(client.camera.distance > 8.0 && client.camera.distance < 45.0);
+
+        // Complete transition (0.25s)
+        let frame_end = client.update(0.25, 500);
+        assert!(!frame_end.is_transitioning);
+        assert_eq!(frame_end.camera_mode, CameraMode::Tactical);
+        assert!((client.camera.distance - 45.0).abs() < 1e-2);
+
+        // Transition from Tactical to Strategic
+        client.set_camera_mode(CameraMode::Strategic, 0.4);
+        assert!(client.camera.is_transitioning());
+        client.update(0.4, 900);
+        assert!(!client.camera.is_transitioning());
+        assert_eq!(client.camera.mode(), CameraMode::Strategic);
+        assert!((client.camera.distance - 180.0).abs() < 1e-2);
+    }
+
+    /// M15 Proving Ground 2: Tactical camera pans freely on ground plane and respects world boundaries.
+    #[test]
+    fn test_m15_tactical_panning_and_boundary_clamping() {
+        let mut client = ClientPresentation::new();
+        client.camera.world_bounds_xz = (-150.0, 150.0, -150.0, 150.0);
+        client.set_camera_mode(CameraMode::Tactical, 0.0);
+        assert_eq!(client.camera.mode(), CameraMode::Tactical);
+
+        // Player avatar is initialized at (20, 0, 20) on open ground
+        let initial_avatar_pos = (20.0, 0.0, 20.0);
+        client.controller.predicted_state.position = initial_avatar_pos;
+        client.controller.authoritative_state.position = initial_avatar_pos;
+
+        // Pan tactical camera target right 60m and forward 40m
+        client.pan_camera(60.0, 40.0);
+        let frame = client.update(0.016, 16);
+
+        // Camera focus panned to (60, 0, 40), while avatar remains at initial position
+        assert!((frame.camera_focus.0 - 60.0).abs() < 1e-2);
+        assert!((frame.camera_focus.2 - 40.0).abs() < 1e-2);
+        assert_eq!(frame.player_position, initial_avatar_pos);
+
+        // Pan far beyond world boundary: must clamp to [-150, 150]
+        client.pan_camera(300.0, 300.0);
+        let clamped_frame = client.update(0.016, 32);
+        assert_eq!(clamped_frame.camera_focus.0, 150.0);
+        assert_eq!(clamped_frame.camera_focus.2, 150.0);
+    }
+
+    /// M15 Proving Ground 3: Point-and-click picking and marquee drag box select units.
+    #[test]
+    fn test_m15_point_and_marquee_box_selection() {
+        let mut client = ClientPresentation::new();
+        client.set_camera_mode(CameraMode::Tactical, 0.0);
+        client.camera.set_target((0.0, 0.0, 0.0));
+
+        let u1 = EntityId::new(10);
+        let u2 = EntityId::new(20);
+        let u3 = EntityId::new(30);
+
+        let candidates = vec![
+            (u1, (0.0, 0.0, 0.0)),
+            (u2, (5.0, 0.0, 5.0)),
+            (u3, (50.0, 0.0, 50.0)),
+        ];
+
+        // Single point pick at center (0, 0)
+        let pick_candidates = vec![
+            (u1, (0.0, 0.0, 0.0), 2.0f32),
+            (u2, (5.0, 0.0, 5.0), 2.0f32),
+            (u3, (50.0, 0.0, 50.0), 2.0f32),
+        ];
+        let hit = client
+            .selection
+            .select_point(&client.camera, 0.0, 0.0, &pick_candidates, false);
+        assert_eq!(hit, Some(u1));
+        assert!(client.selection.contains(u1));
+        assert_eq!(client.selection.len(), 1);
+
+        // Marquee box selection around (0, 0) and (5, 5)
+        client.selection.start_marquee(-0.3, -0.3);
+        client.selection.update_marquee(0.3, 0.3);
+        let selected_count = client.select_marquee(&candidates, false);
+        assert!(
+            selected_count >= 2,
+            "Marquee must select at least u1 and u2"
+        );
+        assert!(client.selection.contains(u1));
+        assert!(client.selection.contains(u2));
+        assert!(!client.selection.contains(u3));
+
+        // Shift select u3
+        client.selection.select_single(u3, true);
+        assert_eq!(client.selection.len(), 3);
+        assert!(client.selection.contains(u3));
+    }
+
+    /// M15 Proving Ground 4: Tactical orders generate valid authoritative server commands.
+    #[test]
+    fn test_m15_tactical_orders_generate_valid_authoritative_server_commands() {
+        use sim_core::test_harness::TestHarness;
+
+        let mut harness = TestHarness::new();
+        let f1 = game_types::FactionId::new(1);
+        let reg = game_types::RegionId::new(1);
+
+        // Spawn 3 friendly robots
+        let r1 = harness
+            .state_mut()
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+        let r2 = harness
+            .state_mut()
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (2.0, 0.0, 0.0),
+            )
+            .unwrap();
+        let r3 = harness
+            .state_mut()
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (4.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let mut client = ClientPresentation::new();
+        client.selection.select_single(r1, true);
+        client.selection.select_single(r2, true);
+        client.selection.select_single(r3, true);
+
+        // Issue move order to (40.0, 0.0, 40.0)
+        let move_cmds = client.issue_tactical_move((40.0, 0.0, 40.0));
+        assert_eq!(move_cmds.len(), 3);
+
+        // Send all commands to authoritative simulation
+        for (i, cmd) in move_cmds.into_iter().enumerate() {
+            let env = sim_core::command::CommandEnvelope::new(
+                game_types::SessionId::new(1),
+                i as u64 + 1,
+                SimTick::zero(),
+                cmd,
+            );
+            harness.state_mut().command_buffer.push(env);
+        }
+
+        // Run simulation ticks to process orders
+        harness.run_for_ticks(5);
+
+        // Robots must have accepted orders and begun moving towards destination
+        for &id in &[r1, r2, r3] {
+            let robot = harness.state().robot_registry.get(id).unwrap();
+            assert!(matches!(
+                robot.order,
+                sim_core::robot::RobotOrder::MoveTo { .. }
+            ));
+            assert!(
+                robot.position.0 > 0.0 || robot.position.2 > 0.0,
+                "Robot must be advancing"
+            );
+        }
+    }
+
+    /// M15 Proving Ground 5: Strategic overlays ingest and reflect subsystems in presentation frames.
+    #[test]
+    fn test_m15_strategic_overlays_ingest_and_reflect_subsystems() {
+        let mut client = ClientPresentation::new();
+        client.set_camera_mode(CameraMode::Tactical, 0.0);
+
+        // Enable all overlays
+        client.overlay_flags.show_power_grid = true;
+        client.overlay_flags.show_logistics_network = true;
+        client.overlay_flags.show_production_summary = true;
+
+        // Select a unit
+        let r1 = EntityId::new(42);
+        client.selection.select_single(r1, false);
+
+        let frame = client.update(0.016, 16);
+
+        // Overlays must be populated
+        assert!(frame.power_overlay.is_some());
+        assert!(frame.logistics_overlay.is_some());
+        assert!(frame.production_summary.is_some());
+        assert_eq!(frame.selection.len(), 1);
+
+        // HUD summary reflects camera mode and unit selection
+        assert!(frame.hud_summary.contains("Tactical"));
+        let card = client.hud.render_ascii_card();
+        assert!(card.contains("Tactical"));
+        assert!(card.contains("Selected Units:          1"));
+    }
+
+    /// M15 Proving Ground 6: Same entities continue simulating identically during camera transitions.
+    #[test]
+    fn test_m15_continuous_simulation_during_camera_transition() {
+        use sim_core::command::Command;
+        use sim_core::test_harness::TestHarness;
+
+        let mut harness = TestHarness::new();
+        let f1 = game_types::FactionId::new(1);
+        let reg = game_types::RegionId::new(1);
+
+        let r1 = harness
+            .state_mut()
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Rifleman,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        // Client starts in ThirdPerson and transitions to Strategic over 30 ticks
+        let mut client = ClientPresentation::new();
+        client.set_camera_mode(CameraMode::Strategic, 1.0); // 1.0s = 30 simulation ticks at 30Hz
+
+        let initial_pos = harness.state().robot_registry.get(r1).unwrap().position;
+
+        // Order robot to move via command buffer
+        let env = sim_core::command::CommandEnvelope::new(
+            game_types::SessionId::new(1),
+            1,
+            SimTick::zero(),
+            Command::RobotCommand {
+                robot_id: r1,
+                command_type: sim_core::command::RobotCommandType::Move {
+                    position: (50.0, 0.0, 50.0),
+                },
+            },
+        );
+        harness.state_mut().command_buffer.push(env);
+
+        // Run 30 ticks of both simulation and presentation
+        for t in 1..=30 {
+            harness.run_for_ticks(1);
+            client.update(1.0 / 30.0, t * 33);
+        }
+
+        let final_pos = harness.state().robot_registry.get(r1).unwrap().position;
+
+        // Simulation stepped continuously without being paused, blocked, or altered by camera transition
+        assert!(
+            final_pos.0 > initial_pos.0 && final_pos.2 > initial_pos.2,
+            "Entity must simulate continuously"
+        );
+        assert!(
+            !client.camera.is_transitioning(),
+            "Transition must complete at tick 30"
+        );
+        assert_eq!(client.camera.mode(), CameraMode::Strategic);
+    }
+
+    /// M15 Proving Ground 7: Panning camera over unknown terrain does not leak hidden entities.
+    #[test]
+    fn test_m15_panning_over_unknown_terrain_does_not_leak_hidden_entities() {
+        use anti_cheat::detectors::detect_hidden_target_attempt;
+        use anti_cheat::event::SecurityEventKind;
+        use anti_cheat::provider::InspectionContext;
+        use sim_core::world::WorldState;
+
+        let mut world = WorldState::new();
+        let f1 = game_types::FactionId::new(1);
+        let f2 = game_types::FactionId::new(2);
+        let reg = game_types::RegionId::new(1);
+
+        // Friendly robot at (0, 0, 0)
+        let _scout = world
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        // Enemy robot concealed in shroud at (350.0, 0.0, 350.0)
+        let enemy = world
+            .spawn_robot(
+                sim_core::chassis::RobotChassis::Rifleman,
+                f2,
+                reg,
+                (350.0, 0.0, 350.0),
+            )
+            .unwrap();
+
+        // Step simulation: enemy is outside Faction 1's sensors and hidden
+        world.step_systems();
+        assert!(
+            !world.faction_knows_entity(f1, enemy),
+            "Enemy must be concealed in shroud"
+        );
+
+        // Client presentation for Faction 1
+        let mut client = ClientPresentation::new();
+        client.faction_id = f1;
+
+        // Pan tactical camera directly to (350.0, 0.0, 350.0) over enemy position
+        client.set_camera_mode(CameraMode::Tactical, 0.0);
+        client.camera.set_target((350.0, 0.0, 350.0));
+        let frame = client.update(0.016, 16);
+
+        // Camera focus is positioned right over the enemy
+        assert_eq!(frame.camera_focus, (350.0, 0.0, 350.0));
+
+        // Client's remote_entities contains 0 entries for the hidden enemy (replication filtering)
+        assert!(!client.remote_entities.contains_key(&enemy));
+        assert!(!frame.remote_entities.iter().any(|(id, _)| *id == enemy));
+
+        // Selection query at (350, 0, 350) finds nothing
+        let candidates: Vec<(EntityId, (f32, f32, f32))> = frame.remote_entities.clone();
+        let count = client.select_marquee(&candidates, false);
+        assert_eq!(count, 0);
+        assert!(!client.selection.contains(enemy));
+
+        // If client synthesizes an attack command against hidden enemy, anti-cheat catches and rejects it!
+        let ctx = InspectionContext::new(
+            game_types::SessionId::new(1),
+            game_types::PlayerId::new(1),
+            f1,
+            SimTick::zero(),
+            SimTick::zero(),
+            1,
+            &world,
+        );
+
+        let event = detect_hidden_target_attempt(&ctx, enemy);
+        assert!(
+            matches!(event, Some(SecurityEventKind::HiddenTargetAttempt { target, .. }) if target == enemy),
+            "Server anti-cheat must reject attack on hidden entity"
+        );
     }
 }

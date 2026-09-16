@@ -15,3 +15,7 @@ path = "src/main.rs"
 sim-core = { path = "../sim-core" }
 game-types = { path = "../game-types" }
 game-protocol = { path = "../game-protocol" }
+
+[dev-dependencies]
+anti-cheat = { path = "../anti-cheat" }
+
