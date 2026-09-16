@@ -18,7 +18,7 @@ This file is maintained by the coding agent.
 | 11 | Logistics Jobs, Depots, Docks, Buffers, and Reservations | COMPLETE |
 | 12 | Basic Biped Robot Framework and Guardsman | COMPLETE |
 | 13 | Combat, Weapons, Damage, Armor, and Projectiles | COMPLETE |
-| 14 | Sensors, Faction Knowledge, Fog, and Replication Interest | NOT STARTED |
+| 14 | Sensors, Faction Knowledge, Fog, and Replication Interest | COMPLETE |
 | 15 | Tactical and Strategic Camera Modes | NOT STARTED |
 | 16 | Hierarchical AI and Scalable Navigation | NOT STARTED |
 | 17 | Defensive Structures | NOT STARTED |
