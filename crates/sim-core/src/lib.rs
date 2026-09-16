@@ -1,4 +1,5 @@
 pub mod chassis;
+pub mod combat;
 pub mod command;
 pub mod dispatch;
 pub mod entity;
@@ -21,6 +22,7 @@ pub mod wall;
 pub mod world;
 
 pub use chassis::*;
+pub use combat::*;
 pub use command::*;
 pub use dispatch::*;
 pub use entity::*;

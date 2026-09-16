@@ -1,4 +1,5 @@
 use crate::chassis::{RobotArchetype, RobotChassis};
+use crate::combat::{MotionPrimitive, Projectile, StatusStore, WeaponState};
 use crate::command::RobotCommandType;
 use crate::event::{EventJournal, SimEvent};
 use crate::navigation::{
@@ -7,7 +8,8 @@ use crate::navigation::{
 };
 use crate::wall::{DamageResult, DamageSpec, calculate_damage};
 use game_types::{
-    EntityId, FactionId, GameError, GameResult, PlayerId, RegionId, SessionId, SimTick, SquadId,
+    EntityId, FactionId, GameError, GameResult, PlayerId, ProjectileId, RegionId, SessionId,
+    SimTick, SquadId, WeaponId,
 };
 use std::collections::BTreeMap;
 
@@ -78,6 +80,8 @@ pub struct Robot {
     /// True when the robot has reached its current goal.
     pub at_goal: bool,
     pub spawn_tick: SimTick,
+    pub weapon: Option<WeaponState>,
+    pub status: StatusStore,
 }
 
 impl Robot {
@@ -89,6 +93,10 @@ impl Robot {
         position: (f32, f32, f32),
         spawn_tick: SimTick,
     ) -> Self {
+        let weapon = chassis
+            .archetype()
+            .default_weapon(WeaponId(entity.0 as u32))
+            .map(WeaponState::new);
         Robot {
             entity,
             chassis,
@@ -105,6 +113,8 @@ impl Robot {
             home_position: position,
             at_goal: true,
             spawn_tick,
+            weapon,
+            status: StatusStore::new(),
         }
     }
 
@@ -330,6 +340,7 @@ pub struct RobotRegistry {
     pub players: BTreeMap<PlayerId, PlayerPresence>,
     pub config: RobotConfig,
     pub next_squad_id: u32,
+    pub pending_projectiles: Vec<Projectile>,
 }
 
 impl Default for RobotRegistry {
@@ -341,6 +352,7 @@ impl Default for RobotRegistry {
             players: BTreeMap::new(),
             config: RobotConfig::default(),
             next_squad_id: 1,
+            pending_projectiles: Vec::new(),
         }
     }
 }
@@ -348,6 +360,11 @@ impl Default for RobotRegistry {
 impl RobotRegistry {
     pub fn new() -> Self {
         RobotRegistry::default()
+    }
+
+    /// Drain all pending projectiles spawned during the tick.
+    pub fn drain_projectiles(&mut self) -> Vec<Projectile> {
+        std::mem::take(&mut self.pending_projectiles)
     }
 
     // ---------------------------------------------------------------- robots
@@ -855,7 +872,31 @@ impl RobotRegistry {
         Ok(members.len())
     }
 
-    // ---------------------------------------------------------------- damage
+    /// Clean up a destroyed robot and record relevant release and destruction events.
+    pub fn cleanup_destroyed_robot(
+        &mut self,
+        robot: EntityId,
+        source: Option<EntityId>,
+        tick: SimTick,
+        journal: &mut EventJournal,
+    ) {
+        if let Some(target) = self.robots.remove(&robot) {
+            if let Some(owner) = target.owner {
+                self.detach_escort(owner, robot);
+                journal.record(
+                    tick,
+                    SimEvent::EscortReleased {
+                        player: owner,
+                        robot,
+                    },
+                );
+            }
+            if let Some(squad_id) = target.squad {
+                let _ = self.detach_squad_member(squad_id, robot);
+            }
+            journal.record(tick, SimEvent::RobotDestroyed { robot, source });
+        }
+    }
 
     /// Apply authoritative damage to a robot using the shared armor/resistance model.
     pub fn apply_damage(
@@ -865,18 +906,21 @@ impl RobotRegistry {
         tick: SimTick,
         journal: &mut EventJournal,
     ) -> GameResult<DamageResult> {
-        let (result, owner, squad) = {
+        let (result, destroyed) = {
             let target = self
                 .robots
                 .get_mut(&robot)
                 .ok_or(GameError::RobotNotFound(robot))?;
-            let result = calculate_damage(
-                target.archetype().armor_profile(),
-                target.current_hp,
-                damage,
-            );
+            let mut armor = target.archetype().armor_profile();
+            let degradation = target.status.total_armor_degradation();
+            armor.flat_armor = (armor.flat_armor - degradation).max(0.0);
+
+            let result = calculate_damage(armor, target.current_hp, damage);
             target.current_hp = result.remaining_hp;
-            (result, target.owner, target.squad)
+            if let Some(effect) = damage.effect {
+                target.status.apply_effect(effect);
+            }
+            (result, result.destroyed)
         };
 
         journal.record(
@@ -888,28 +932,8 @@ impl RobotRegistry {
             },
         );
 
-        if result.destroyed {
-            if let Some(owner) = owner {
-                self.detach_escort(owner, robot);
-                journal.record(
-                    tick,
-                    SimEvent::EscortReleased {
-                        player: owner,
-                        robot,
-                    },
-                );
-            }
-            if let Some(squad_id) = squad {
-                let _ = self.detach_squad_member(squad_id, robot);
-            }
-            self.robots.remove(&robot);
-            journal.record(
-                tick,
-                SimEvent::RobotDestroyed {
-                    robot,
-                    source: damage.source,
-                },
-            );
+        if destroyed {
+            self.cleanup_destroyed_robot(robot, damage.source, tick, journal);
         }
 
         Ok(result)
@@ -931,11 +955,14 @@ impl RobotRegistry {
                 None => NavGoal::Hold,
             },
             RobotOrder::Attack { target } => match self.position_of(target) {
-                Some(target_pos) => NavGoal::Position(standoff_position(
-                    target_pos,
-                    robot.position,
-                    self.config.attack_standoff,
-                )),
+                Some(target_pos) => {
+                    let standoff = robot
+                        .weapon
+                        .as_ref()
+                        .map(|w| (w.def.range * 0.75).max(1.0))
+                        .unwrap_or(self.config.attack_standoff);
+                    NavGoal::Position(standoff_position(target_pos, robot.position, standoff))
+                }
                 None => NavGoal::Hold,
             },
             RobotOrder::Regroup { squad_id } => match self.squads.get(&squad_id) {
@@ -1022,7 +1049,7 @@ impl RobotRegistry {
         let mut neighbors: Vec<NavObstacle> = Vec::with_capacity(16);
         let mut arrivals: Vec<(EntityId, (f32, f32, f32))> = Vec::new();
 
-        for id in ids {
+        for &id in &ids {
             let (position, velocity, facing_deg, chassis, goal) = match self.robots.get(&id) {
                 Some(robot) => (
                     robot.position,
@@ -1050,8 +1077,14 @@ impl RobotRegistry {
                 }
             }
 
+            let speed_mult = match self.robots.get(&id) {
+                Some(r) => r.status.speed_multiplier(),
+                None => 1.0,
+            };
+            let effective_speed = archetype.move_speed * speed_mult;
+
             let params = SteeringParams {
-                max_speed: archetype.move_speed,
+                max_speed: effective_speed,
                 step_seconds: dt,
                 arrival_tolerance: archetype.arrival_tolerance,
                 slowdown_radius: archetype.arrival_tolerance.max(0.1) * 3.0,
@@ -1079,11 +1112,15 @@ impl RobotRegistry {
                 vz = velocity.2 + dvz * scale;
             }
             let speed_sq = vx * vx + vz * vz;
-            let max_speed = archetype.move_speed;
+            let max_speed = effective_speed;
             if speed_sq > max_speed * max_speed && speed_sq > 1.0e-10 {
                 let scale = max_speed / speed_sq.sqrt();
                 vx *= scale;
                 vz *= scale;
+            }
+            if speed_mult == 0.0 {
+                vx = 0.0;
+                vz = 0.0;
             }
 
             let new_velocity = (vx, 0.0, vz);
@@ -1105,11 +1142,159 @@ impl RobotRegistry {
                 } else if !output.arrived {
                     robot.at_goal = false;
                 }
+
+                // Advance status timers and apply DoT damage
+                let dot_damage = robot.status.tick();
+                if dot_damage > 0.0 {
+                    robot.current_hp = robot.current_hp.saturating_sub(dot_damage.ceil() as u32);
+                }
+
+                // Advance weapon cycle / reload timer
+                if let Some(ref mut weapon) = robot.weapon {
+                    weapon.tick();
+                }
+            }
+        }
+
+        // 5. Authoritative combat actions (weapons discharge, melee strikes, Charger ram)
+        let mut direct_attacks: Vec<(EntityId, DamageSpec)> = Vec::new();
+        let mut spawned_projectiles: Vec<Projectile> = Vec::new();
+
+        for &id in &ids {
+            let (target, is_charger, body_radius, turn_rate, mass_kg) = match self.robots.get(&id) {
+                Some(r) => {
+                    if r.current_hp == 0 {
+                        continue;
+                    }
+                    match r.order {
+                        RobotOrder::Attack { target } => (
+                            target,
+                            r.chassis == RobotChassis::Charger,
+                            r.archetype().body_radius,
+                            r.archetype().turn_rate_deg,
+                            r.archetype().mass_kg,
+                        ),
+                        _ => continue,
+                    }
+                }
+                None => continue,
+            };
+
+            let target_pos = match self.position_of(target) {
+                Some(pos) => pos,
+                None => continue,
+            };
+
+            let robot = match self.robots.get_mut(&id) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let dist = planar_distance(robot.position, target_pos);
+            let dx = target_pos.0 - robot.position.0;
+            let dz = target_pos.2 - robot.position.2;
+
+            // Orient toward target if not moving fast
+            if planar_length(robot.velocity) < FACING_MIN_SPEED && (dx * dx + dz * dz) > 0.001 {
+                let aim_heading = dx.atan2(dz).to_degrees().rem_euclid(360.0);
+                robot.facing_deg = turn_toward_deg(robot.facing_deg, aim_heading, turn_rate * dt);
+            }
+
+            // Special: Charger high-mass kinetic ram collision
+            if is_charger {
+                let speed = planar_length(robot.velocity);
+                if speed > 2.0 && dist <= body_radius + 1.5 {
+                    let impact =
+                        DamageSpec::new_impact(mass_kg, speed, 0.5).with_source(robot.entity);
+                    direct_attacks.push((target, impact));
+                }
+            }
+
+            let Some(ref mut weapon) = robot.weapon else {
+                continue;
+            };
+
+            if dist <= weapon.def.range && weapon.can_fire() && weapon.discharge(1000) {
+                match weapon.def.motion {
+                    MotionPrimitive::Linear { speed, max_range } => {
+                        let (dir_x, dir_z) = if dist > 0.001 {
+                            (dx / dist, dz / dist)
+                        } else {
+                            (0.0, 1.0)
+                        };
+                        let mut damage = weapon.def.base_damage;
+                        damage.source = Some(robot.entity);
+                        spawned_projectiles.push(Projectile::new_linear(
+                            crate::combat::LinearProjectileSpec {
+                                id: ProjectileId(0),
+                                owner: Some(robot.entity),
+                                faction_id: robot.faction_id,
+                                origin: robot.position,
+                                direction: (dir_x, 0.0, dir_z),
+                                speed,
+                                max_range,
+                                damage,
+                                splash_radius: weapon.def.splash_radius,
+                                spawn_tick: tick,
+                            },
+                        ));
+                    }
+                    MotionPrimitive::Ballistic { gravity, .. } => {
+                        let t_flight = 1.0f32.max(dist / 25.0);
+                        let vy = 0.5 * gravity * t_flight;
+                        let vx = dx / t_flight;
+                        let vz = dz / t_flight;
+                        let mut damage = weapon.def.base_damage;
+                        damage.source = Some(robot.entity);
+                        spawned_projectiles.push(Projectile::new_ballistic(
+                            crate::combat::BallisticProjectileSpec {
+                                id: ProjectileId(0),
+                                owner: Some(robot.entity),
+                                faction_id: robot.faction_id,
+                                origin: robot.position,
+                                initial_velocity: (vx, vy, vz),
+                                gravity,
+                                max_range: weapon.def.range,
+                                damage,
+                                splash_radius: weapon.def.splash_radius,
+                                spawn_tick: tick,
+                                max_flight_ticks: (t_flight * 30.0).ceil() as u64 + 10,
+                            },
+                        ));
+                    }
+                    MotionPrimitive::PhysicalMelee { reach }
+                        if dist <= reach + body_radius + 0.5 =>
+                    {
+                        let mut damage = weapon.def.base_damage;
+                        damage.source = Some(robot.entity);
+                        direct_attacks.push((target, damage));
+                    }
+                    _ => {}
+                }
             }
         }
 
         for (robot, position) in arrivals {
             journal.record(tick, SimEvent::RobotArrived { robot, position });
+        }
+
+        for proj in spawned_projectiles {
+            self.pending_projectiles.push(proj);
+        }
+
+        for (target, damage) in direct_attacks {
+            let _ = self.apply_damage(target, damage, tick, journal);
+        }
+
+        // Clean up robots destroyed by DoT effects
+        let dead_robots: Vec<EntityId> = self
+            .robots
+            .iter()
+            .filter(|(_, r)| r.current_hp == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        for dead in dead_robots {
+            self.cleanup_destroyed_robot(dead, None, tick, journal);
         }
     }
 }

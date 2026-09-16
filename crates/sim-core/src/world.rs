@@ -13,6 +13,7 @@
 //! that escape hatch is not reachable from the network.
 
 use crate::chassis::RobotChassis;
+use crate::combat::ProjectileRegistry;
 use crate::command::{CommandBuffer, CommandEnvelope};
 use crate::entity::EntityRegistry;
 use crate::event::{EventJournal, SimEvent};
@@ -61,6 +62,7 @@ pub struct WorldState {
     pub event_journal: EventJournal,
     pub robot_registry: RobotRegistry,
     pub research_manager: ResearchManager,
+    pub projectiles: ProjectileRegistry,
     /// Authoritative collision world. The server clamps every accepted player
     /// position against this; the client uses the same structure to predict.
     pub terrain: GreyboxTerrain,
@@ -73,6 +75,90 @@ pub struct WorldState {
 impl Default for WorldState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test if a 2D line segment intersects a circle and return the normalized parameter t in [0, 1].
+fn segment_intersects_circle(
+    x0: f32,
+    z0: f32,
+    x1: f32,
+    z1: f32,
+    cx: f32,
+    cz: f32,
+    radius: f32,
+) -> Option<f32> {
+    let dx = x1 - x0;
+    let dz = z1 - z0;
+    let len_sq = dx * dx + dz * dz;
+    let t = if len_sq < 1e-6 {
+        0.0
+    } else {
+        let proj = (cx - x0) * dx + (cz - z0) * dz;
+        (proj / len_sq).clamp(0.0, 1.0)
+    };
+    let px = x0 + t * dx;
+    let pz = z0 + t * dz;
+    let dist_sq = (cx - px).powi(2) + (cz - pz).powi(2);
+    if dist_sq <= radius * radius {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// Test if a 2D line segment intersects an axis-aligned bounding box and return entry parameter t.
+fn segment_intersects_aabb(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    b_min: (f32, f32),
+    b_max: (f32, f32),
+) -> Option<f32> {
+    let dx = p1.0 - p0.0;
+    let dz = p1.1 - p0.1;
+    let mut t_min = 0.0f32;
+    let mut t_max = 1.0f32;
+
+    if dx.abs() < 1e-6 {
+        if p0.0 < b_min.0 || p0.0 > b_max.0 {
+            return None;
+        }
+    } else {
+        let inv_d = 1.0 / dx;
+        let mut t1 = (b_min.0 - p0.0) * inv_d;
+        let mut t2 = (b_max.0 - p0.0) * inv_d;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+
+    if dz.abs() < 1e-6 {
+        if p0.1 < b_min.1 || p0.1 > b_max.1 {
+            return None;
+        }
+    } else {
+        let inv_d = 1.0 / dz;
+        let mut t1 = (b_min.1 - p0.1) * inv_d;
+        let mut t2 = (b_max.1 - p0.1) * inv_d;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+
+    if t_min <= 1.0 && t_max >= 0.0 {
+        Some(t_min.max(0.0))
+    } else {
+        None
     }
 }
 
@@ -92,6 +178,7 @@ impl WorldState {
             event_journal: EventJournal::new(),
             robot_registry: RobotRegistry::new(),
             research_manager: ResearchManager::new(),
+            projectiles: ProjectileRegistry::new(),
             terrain: GreyboxTerrain::default(),
             movement_config: MovementConfig::default(),
             pending_session_directives: Vec::new(),
@@ -672,9 +759,329 @@ impl WorldState {
         // Step authoritative robot movement, navigation, and escort behaviour
         self.robot_registry.step(self.tick, &mut self.event_journal);
 
+        // Collect newly spawned projectiles from robots
+        for proj in self.robot_registry.drain_projectiles() {
+            let pid = self.projectiles.spawn(proj.clone());
+            self.event_journal.record(
+                self.tick,
+                SimEvent::ProjectileSpawned {
+                    projectile_id: pid,
+                    owner: proj.owner,
+                    position: proj.position,
+                },
+            );
+        }
+
+        // Turret automated targeting and firing
+        self.step_turret_combat();
+
+        // Advance active projectiles and resolve impacts
+        self.step_projectiles();
+
         // Run multi-rate scheduler across regions
         self.scheduler
             .tick(self.tick, &mut self.region_map, &mut self.router);
+    }
+
+    /// Automated target acquisition and firing for operational defensive turrets.
+    pub fn step_turret_combat(&mut self) {
+        struct TurretShot {
+            faction_id: FactionId,
+            origin: (f32, f32, f32),
+            dir: (f32, f32, f32),
+            dmg: crate::wall::DamageSpec,
+            speed: f32,
+            max_range: f32,
+        }
+
+        let mut turret_shots: Vec<TurretShot> = Vec::new();
+
+        for structure in self.structure_registry.structures.values_mut() {
+            if !structure.can_fire() {
+                continue;
+            }
+            if let Some(ref mut weapon) = structure.weapon {
+                weapon.tick();
+                if !weapon.can_fire() {
+                    continue;
+                }
+
+                // Acquire nearest hostile robot within range
+                let mut best_target: Option<((f32, f32, f32), f32)> = None;
+                for robot in self.robot_registry.robots.values() {
+                    if robot.faction_id == structure.faction_id || robot.current_hp == 0 {
+                        continue;
+                    }
+                    let d = crate::navigation::planar_distance(structure.position, robot.position);
+                    if d <= weapon.def.range {
+                        match best_target {
+                            None => best_target = Some((robot.position, d)),
+                            Some((_, best_d)) if d < best_d => {
+                                best_target = Some((robot.position, d))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some((target_pos, dist)) = best_target {
+                    let fire_rate_mod = self.research_manager.modifiers.multiplier_milli(
+                        structure.faction_id,
+                        crate::modifier::ModifierKind::WeaponFireRate,
+                    );
+                    let damage_mod = self.research_manager.modifiers.multiplier_milli(
+                        structure.faction_id,
+                        crate::modifier::ModifierKind::WeaponDamage,
+                    );
+
+                    if weapon.discharge(fire_rate_mod) {
+                        let dx = target_pos.0 - structure.position.0;
+                        let dz = target_pos.2 - structure.position.2;
+                        let dir = if dist > 0.001 {
+                            (dx / dist, 0.0, dz / dist)
+                        } else {
+                            (0.0, 0.0, 1.0)
+                        };
+                        let mut dmg = weapon.def.base_damage;
+                        dmg.raw_damage = (dmg.raw_damage * (damage_mod as f32 / 1000.0)).max(1.0);
+                        dmg.source = Some(EntityId::new(structure.id.value()));
+
+                        if let crate::combat::MotionPrimitive::Linear { speed, max_range } =
+                            weapon.def.motion
+                        {
+                            turret_shots.push(TurretShot {
+                                faction_id: structure.faction_id,
+                                origin: structure.position,
+                                dir,
+                                dmg,
+                                speed,
+                                max_range,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for shot in turret_shots {
+            let proj = crate::combat::Projectile::new_linear(crate::combat::LinearProjectileSpec {
+                id: game_types::ProjectileId(0),
+                owner: None,
+                faction_id: shot.faction_id,
+                origin: shot.origin,
+                direction: shot.dir,
+                speed: shot.speed,
+                max_range: shot.max_range,
+                damage: shot.dmg,
+                splash_radius: 0.0,
+                spawn_tick: self.tick,
+            });
+            self.projectiles.spawn(proj);
+        }
+    }
+
+    /// Advance active projectiles, perform swept collision testing, and apply damage.
+    pub fn step_projectiles(&mut self) {
+        let current_tick = self.tick;
+        let impacts = self
+            .projectiles
+            .step_all(current_tick, |proj, old_pos, new_pos| {
+                let dx = new_pos.0 - old_pos.0;
+                let dy = new_pos.1 - old_pos.1;
+                let dz = new_pos.2 - old_pos.2;
+
+                let mut best_hit: Option<(f32, EntityId, (f32, f32, f32))> = None;
+
+                // 1. Robot body swept collision check
+                for robot in self.robot_registry.robots.values() {
+                    if proj.owner == Some(robot.entity)
+                        || proj.faction_id == robot.faction_id
+                        || robot.current_hp == 0
+                    {
+                        continue;
+                    }
+                    let body_r = robot.archetype().body_radius;
+                    if let Some(t) = segment_intersects_circle(
+                        old_pos.0,
+                        old_pos.2,
+                        new_pos.0,
+                        new_pos.2,
+                        robot.position.0,
+                        robot.position.2,
+                        body_r,
+                    ) {
+                        let hit_pos = (old_pos.0 + t * dx, old_pos.1 + t * dy, old_pos.2 + t * dz);
+                        match best_hit {
+                            None => best_hit = Some((t, robot.entity, hit_pos)),
+                            Some((best_t, _, _)) if t < best_t => {
+                                best_hit = Some((t, robot.entity, hit_pos));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // 2. Structure AABB swept collision check
+                for structure in self.structure_registry.structures.values() {
+                    if structure.faction_id == proj.faction_id {
+                        continue;
+                    }
+                    let (min_x, max_x, min_z, max_z) = (
+                        structure.bounds_min.0,
+                        structure.bounds_max.0,
+                        structure.bounds_min.2,
+                        structure.bounds_max.2,
+                    );
+                    if let Some(t) = segment_intersects_aabb(
+                        (old_pos.0, old_pos.2),
+                        (new_pos.0, new_pos.2),
+                        (min_x, min_z),
+                        (max_x, max_z),
+                    ) {
+                        let hit_pos = (old_pos.0 + t * dx, old_pos.1 + t * dy, old_pos.2 + t * dz);
+                        let struct_entity = EntityId::new(structure.id.value());
+                        match best_hit {
+                            None => best_hit = Some((t, struct_entity, hit_pos)),
+                            Some((best_t, _, _)) if t < best_t => {
+                                best_hit = Some((t, struct_entity, hit_pos));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // 3. Terrain floor collision check (for ballistic trajectories)
+                if matches!(
+                    proj.motion,
+                    crate::combat::MotionPrimitive::Ballistic { .. }
+                ) {
+                    let floor_t = if old_pos.1 > 0.0 && new_pos.1 <= 0.0 {
+                        let denom = old_pos.1 - new_pos.1;
+                        if denom.abs() > 1e-6 {
+                            Some((old_pos.1 / denom).clamp(0.0, 1.0))
+                        } else {
+                            Some(0.0)
+                        }
+                    } else if new_pos.1 <= 0.0 && old_pos.1 <= 0.0 {
+                        Some(0.0)
+                    } else {
+                        None
+                    };
+
+                    if let Some(t) = floor_t {
+                        match best_hit {
+                            None => {
+                                let hit_pos = (old_pos.0 + t * dx, 0.0, old_pos.2 + t * dz);
+                                best_hit = Some((t, EntityId::null(), hit_pos));
+                            }
+                            Some((best_t, _, _)) if t < best_t => {
+                                let hit_pos = (old_pos.0 + t * dx, 0.0, old_pos.2 + t * dz);
+                                best_hit = Some((t, EntityId::null(), hit_pos));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                best_hit.map(|(_, entity, pos)| (entity, pos))
+            });
+
+        for impact in impacts {
+            self.event_journal.record(
+                current_tick,
+                SimEvent::ProjectileImpacted {
+                    projectile_id: impact.projectile_id,
+                    target: if impact.target.is_null() {
+                        None
+                    } else {
+                        Some(impact.target)
+                    },
+                    position: impact.hit_pos,
+                },
+            );
+
+            // Direct target damage
+            if !impact.target.is_null() {
+                if self.robot_registry.robots.contains_key(&impact.target) {
+                    let _ = self.robot_registry.apply_damage(
+                        impact.target,
+                        impact.damage,
+                        current_tick,
+                        &mut self.event_journal,
+                    );
+                } else {
+                    let structure_id = StructureId::new(impact.target.0);
+                    if self.structure_registry.get(structure_id).is_some() {
+                        let _ = self.structure_registry.apply_damage(
+                            structure_id,
+                            impact.damage,
+                            current_tick,
+                            &mut self.event_journal,
+                        );
+                    }
+                }
+            }
+
+            // Splash AoE damage with radial distance falloff
+            if impact.splash_radius > 0.0 {
+                let splash_robots: Vec<(EntityId, f32)> = self
+                    .robot_registry
+                    .robots
+                    .values()
+                    .filter(|r| {
+                        r.entity != impact.target
+                            && r.faction_id != impact.faction_id
+                            && r.current_hp > 0
+                    })
+                    .map(|r| {
+                        (
+                            r.entity,
+                            crate::navigation::planar_distance(impact.hit_pos, r.position),
+                        )
+                    })
+                    .filter(|(_, dist)| *dist <= impact.splash_radius)
+                    .collect();
+
+                for (target_id, dist) in splash_robots {
+                    let falloff = (1.0 - (dist / impact.splash_radius)).clamp(0.1, 1.0);
+                    let splash_dmg = impact.damage.scaled(falloff);
+                    let _ = self.robot_registry.apply_damage(
+                        target_id,
+                        splash_dmg,
+                        current_tick,
+                        &mut self.event_journal,
+                    );
+                }
+
+                let splash_structures: Vec<(StructureId, f32)> = self
+                    .structure_registry
+                    .structures
+                    .values()
+                    .filter(|s| {
+                        EntityId::new(s.id.value()) != impact.target
+                            && s.faction_id != impact.faction_id
+                    })
+                    .map(|s| {
+                        (
+                            s.id,
+                            crate::navigation::planar_distance(impact.hit_pos, s.position),
+                        )
+                    })
+                    .filter(|(_, dist)| *dist <= impact.splash_radius)
+                    .collect();
+
+                for (s_id, dist) in splash_structures {
+                    let falloff = (1.0 - (dist / impact.splash_radius)).clamp(0.1, 1.0);
+                    let splash_dmg = impact.damage.scaled(falloff);
+                    let _ = self.structure_registry.apply_damage(
+                        s_id,
+                        splash_dmg,
+                        current_tick,
+                        &mut self.event_journal,
+                    );
+                }
+            }
+        }
     }
 
     /// Clone the state for deterministic rollback testing.

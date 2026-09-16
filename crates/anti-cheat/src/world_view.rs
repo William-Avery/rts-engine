@@ -133,6 +133,46 @@ impl WorldView for WorldState {
             .get(entity)
             .map(|inv| inv.total_quantity(resource))
     }
+
+    fn weapon_cooldown_ticks(&self, actor: EntityId) -> Option<u64> {
+        if let Some(weapon) = self
+            .robot_registry
+            .robots
+            .get(&actor)
+            .and_then(|r| r.weapon.as_ref())
+        {
+            return Some(weapon.def.cycle_ticks as u64);
+        }
+        let struct_id = StructureId::new(actor.0);
+        if let Some(weapon) = self
+            .structure_registry
+            .get(struct_id)
+            .and_then(|s| s.weapon.as_ref())
+        {
+            return Some(weapon.def.cycle_ticks as u64);
+        }
+        None
+    }
+
+    fn loaded_ammo(&self, actor: EntityId) -> Option<u32> {
+        if let Some(weapon) = self
+            .robot_registry
+            .robots
+            .get(&actor)
+            .and_then(|r| r.weapon.as_ref())
+        {
+            return Some(weapon.loaded_ammo);
+        }
+        let struct_id = StructureId::new(actor.0);
+        if let Some(weapon) = self
+            .structure_registry
+            .get(struct_id)
+            .and_then(|s| s.weapon.as_ref())
+        {
+            return Some(weapon.loaded_ammo);
+        }
+        None
+    }
 }
 
 /// Hand-built world used by detector unit tests and by callers that have no
@@ -274,6 +314,22 @@ mod tests {
         let sim = WorldState::new();
         assert_eq!(sim.weapon_cooldown_ticks(EntityId::new(1)), None);
         assert_eq!(sim.loaded_ammo(EntityId::new(1)), None);
+    }
+
+    #[test]
+    fn test_milestone_13_weapon_hooks_return_robot_weapon_state() {
+        let mut sim = WorldState::new();
+        let entity = sim
+            .spawn_robot(
+                sim_core::RobotChassis::Rifleman,
+                FactionId::new(1),
+                RegionId::new(1),
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        assert_eq!(sim.weapon_cooldown_ticks(entity), Some(6));
+        assert_eq!(sim.loaded_ammo(entity), Some(30));
     }
 
     #[test]

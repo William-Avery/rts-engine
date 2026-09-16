@@ -1,4 +1,4 @@
-use game_types::{EntityId, SimTick};
+use game_types::{EntityId, ProjectileId, SimTick};
 
 /// Event identifier.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
@@ -267,6 +267,18 @@ pub enum SimEvent {
         faction_id: game_types::FactionId,
         patch_version: u64,
         source_count: usize,
+    },
+    /// Projectile spawned into flight
+    ProjectileSpawned {
+        projectile_id: ProjectileId,
+        owner: Option<EntityId>,
+        position: (f32, f32, f32),
+    },
+    /// Projectile impacted a target or terrain
+    ProjectileImpacted {
+        projectile_id: ProjectileId,
+        target: Option<EntityId>,
+        position: (f32, f32, f32),
     },
 }
 

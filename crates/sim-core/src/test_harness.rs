@@ -116,6 +116,21 @@ impl TestHarness {
         self.state.add_command(envelope);
     }
 
+    /// Issue a standing order to a robot directly under server authority.
+    pub fn issue_robot_order(
+        &mut self,
+        robot: EntityId,
+        order: crate::robot::RobotOrder,
+    ) -> GameResult<()> {
+        let tick = self.state.tick;
+        let WorldState {
+            robot_registry,
+            event_journal,
+            ..
+        } = &mut self.state;
+        robot_registry.set_order(robot, order, tick, event_journal)
+    }
+
     /// Create a logistics job in the simulation state.
     pub fn create_logistics_job(
         &mut self,
@@ -1225,11 +1240,7 @@ mod tests {
         assert!(harness.state().can_turret_fire(turret_id));
 
         // Acceptance test: Destroying relay Pylon 1 depowers downstream infrastructure
-        let dmg = crate::wall::DamageSpec {
-            raw_damage: 1000.0,
-            armor_penetration: 0.0,
-            source: None,
-        };
+        let dmg = crate::wall::DamageSpec::new(1000.0);
         let res = harness
             .state_mut()
             .apply_structure_damage(pylon1_id, dmg)
@@ -3422,11 +3433,7 @@ mod tests {
                 .structure_registry
                 .apply_damage(
                     wall,
-                    crate::wall::DamageSpec {
-                        raw_damage: 300.0,
-                        armor_penetration: 1000.0,
-                        source: None,
-                    },
+                    crate::wall::DamageSpec::new(300.0).with_penetration(1000.0),
                     SimTick::new(1),
                     &mut journal,
                 )
@@ -3518,5 +3525,569 @@ mod tests {
         let b = run_script();
         assert_eq!(a, b);
         assert!(!a.is_empty());
+    }
+
+    // =========================================================================
+    // Milestone 13: Combat, Weapons, Damage, Armor, and Projectiles
+    // =========================================================================
+
+    /// Proving Ground 1: Rifleman linear projectile kinetic attack against enemy biped.
+    #[test]
+    fn test_m13_rifleman_attacks_enemy_linear_projectiles_and_damage() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        let rifleman = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Rifleman,
+                f1,
+                region,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+        let enemy = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f2,
+                region,
+                (15.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_enemy_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&enemy)
+            .unwrap()
+            .current_hp;
+        assert_eq!(initial_enemy_hp, 900);
+
+        // Order Rifleman to attack the enemy
+        harness
+            .issue_robot_order(rifleman, crate::robot::RobotOrder::Attack { target: enemy })
+            .unwrap();
+
+        // Run simulation for 25 ticks (less than 1 second, enough for multiple shots and travel)
+        harness.run_for_ticks(25);
+
+        let final_enemy_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&enemy)
+            .unwrap()
+            .current_hp;
+        assert!(
+            final_enemy_hp < initial_enemy_hp,
+            "Enemy biped must have sustained damage from linear projectiles! initial: {initial_enemy_hp}, final: {final_enemy_hp}"
+        );
+
+        // Verify combat events in journal
+        let has_spawned = harness
+            .state()
+            .event_journal
+            .events_since(SimTick::zero())
+            .iter()
+            .any(|(_, ev)| matches!(ev, SimEvent::ProjectileSpawned { owner, .. } if *owner == Some(rifleman)));
+        assert!(
+            has_spawned,
+            "Expected ProjectileSpawned event from Rifleman"
+        );
+
+        let has_impacted = harness
+            .state()
+            .event_journal
+            .events_since(SimTick::zero())
+            .iter()
+            .any(|(_, ev)| matches!(ev, SimEvent::ProjectileImpacted { target, .. } if *target == Some(enemy)));
+        assert!(has_impacted, "Expected ProjectileImpacted event on enemy");
+    }
+
+    /// Proving Ground 2: Grenadier ballistic arc and radial AoE splash falloff.
+    #[test]
+    fn test_m13_grenadier_ballistic_arc_and_splash_aoe_falloff() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        let grenadier = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Grenadier,
+                f1,
+                region,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+        // Primary target at (20, 0, 0)
+        let target = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f2,
+                region,
+                (20.0, 0.0, 0.0),
+            )
+            .unwrap();
+        // Bystander at (22, 0, 0) (2 meters away from target, well within 4.5m splash radius)
+        let bystander = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f2,
+                region,
+                (22.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_target_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .current_hp;
+        let initial_bystander_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&bystander)
+            .unwrap()
+            .current_hp;
+
+        harness
+            .issue_robot_order(grenadier, crate::robot::RobotOrder::Attack { target })
+            .unwrap();
+
+        // Run simulation for 45 ticks allowing grenade launch, arc flight, and detonation
+        harness.run_for_ticks(45);
+
+        let target_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .current_hp;
+        let bystander_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&bystander)
+            .unwrap()
+            .current_hp;
+
+        assert!(
+            target_hp < initial_target_hp,
+            "Primary target must take direct/splash damage"
+        );
+        assert!(
+            bystander_hp < initial_bystander_hp,
+            "Bystander within splash radius must take AoE splash damage"
+        );
+        assert!(
+            target_hp <= bystander_hp,
+            "Direct target takes higher or equal damage than radial bystander"
+        );
+    }
+
+    /// Proving Ground 3: Swarmer close-quarters melee bite and Charger high-momentum kinetic ram.
+    #[test]
+    fn test_m13_swarmer_melee_and_charger_momentum_ram() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        // Friendly Guardsman target
+        let target = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f1,
+                region,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .current_hp;
+        assert_eq!(initial_hp, 900);
+
+        // Swarmer nearby at 3m
+        let swarmer = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Swarmer,
+                f2,
+                region,
+                (3.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness
+            .issue_robot_order(swarmer, crate::robot::RobotOrder::Attack { target })
+            .unwrap();
+
+        // Run 30 ticks for Swarmer to close distance and strike
+        harness.run_for_ticks(30);
+
+        let hp_after_swarmer = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .current_hp;
+        assert!(
+            hp_after_swarmer < initial_hp,
+            "Swarmer melee bites must damage target"
+        );
+
+        // Now spawn Charger further away at 30m and charge
+        let charger = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Charger,
+                f2,
+                region,
+                (30.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness
+            .issue_robot_order(charger, crate::robot::RobotOrder::Attack { target })
+            .unwrap();
+
+        // Run 60 ticks for Charger to build speed and ram target
+        harness.run_for_ticks(60);
+
+        // Heavy mass ram collision should inflict devastating impact damage
+        let target_destroyed = !harness.state().robot_registry.robots.contains_key(&target)
+            || harness
+                .state()
+                .robot_registry
+                .robots
+                .get(&target)
+                .unwrap()
+                .current_hp
+                < hp_after_swarmer;
+        assert!(
+            target_destroyed,
+            "Charger ram collision must smash target biped"
+        );
+    }
+
+    /// Proving Ground 4: Spitter corrosive acid armor degradation and damage-over-time.
+    #[test]
+    fn test_m13_spitter_corrosive_acid_armor_strip_and_dot() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        let target = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::AntiArmor,
+                f1,
+                region,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+        let spitter = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Spitter,
+                f2,
+                region,
+                (15.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_armor = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .archetype()
+            .armor_profile()
+            .flat_armor;
+        assert_eq!(initial_armor, 22.0);
+        let initial_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&target)
+            .unwrap()
+            .current_hp;
+        assert_eq!(initial_hp, 1200);
+
+        harness
+            .issue_robot_order(spitter, crate::robot::RobotOrder::Attack { target })
+            .unwrap();
+
+        // Run 40 ticks: acid projectile launches, hits, applies ArmorDegradation and damage
+        harness.run_for_ticks(40);
+
+        let target_robot = harness.state().robot_registry.robots.get(&target).unwrap();
+        assert!(
+            target_robot.status.total_armor_degradation() > 0.0,
+            "Acid must degrade flat armor"
+        );
+        assert!(
+            target_robot.current_hp < initial_hp,
+            "Spitter acid must reduce HP"
+        );
+    }
+
+    /// Proving Ground 5: Anti-Armor railgun punching through heavy composite wall.
+    #[test]
+    fn test_m13_anti_armor_railgun_heavy_penetration() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        let anti_armor = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::AntiArmor,
+                f1,
+                region,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+        let heavy_target = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Charger,
+                f2,
+                region,
+                (25.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&heavy_target)
+            .unwrap()
+            .current_hp;
+        assert_eq!(initial_hp, 2000);
+
+        harness
+            .issue_robot_order(
+                anti_armor,
+                crate::robot::RobotOrder::Attack {
+                    target: heavy_target,
+                },
+            )
+            .unwrap();
+
+        // Run 20 ticks
+        harness.run_for_ticks(20);
+
+        let final_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&heavy_target)
+            .unwrap()
+            .current_hp;
+        let delta = initial_hp - final_hp;
+        assert!(
+            delta >= 90,
+            "AntiArmor railgun must punch through heavy armor for at least 90 net damage, got {delta}"
+        );
+    }
+
+    /// Proving Ground 6: Automated defensive Turret point defense and power dependency.
+    #[test]
+    fn test_m13_turret_automated_point_defense_and_power_dependency() {
+        let mut harness = TestHarness::new();
+        let region = RegionId::new(1);
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+
+        // 1. Build Generator and Turret for Faction 1
+        let gen_id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(
+                crate::structure::BuildRequest {
+                    player_pos: (0.0, 0.0, 0.0),
+                    requested_pos: (0.0, 0.0, 0.0),
+                    kind: crate::structure::StructureKind::Generator,
+                    rotation_deg: 0.0,
+                    faction_id: f1,
+                    region_id: region,
+                    creation_tick: SimTick::zero(),
+                    world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+                },
+                None,
+            )
+            .unwrap();
+        let turret_id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(
+                crate::structure::BuildRequest {
+                    player_pos: (5.0, 0.0, 0.0),
+                    requested_pos: (5.0, 0.0, 0.0),
+                    kind: crate::structure::StructureKind::Turret,
+                    rotation_deg: 0.0,
+                    faction_id: f1,
+                    region_id: region,
+                    creation_tick: SimTick::zero(),
+                    world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+                },
+                None,
+            )
+            .unwrap();
+
+        harness
+            .state_mut()
+            .structure_registry
+            .complete_construction(gen_id)
+            .unwrap();
+        harness
+            .state_mut()
+            .structure_registry
+            .complete_construction(turret_id)
+            .unwrap();
+
+        // Advance 1 tick to solve power network
+        harness.step_tick();
+
+        assert!(
+            harness
+                .state()
+                .structure_registry
+                .get(turret_id)
+                .unwrap()
+                .can_fire(),
+            "Turret must be powered and operational"
+        );
+
+        // 2. Spawn hostile Swarmer at 20m
+        let hostile = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Swarmer,
+                f2,
+                region,
+                (20.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let initial_hostile_hp = harness
+            .state()
+            .robot_registry
+            .robots
+            .get(&hostile)
+            .unwrap()
+            .current_hp;
+
+        // Run 25 ticks: Turret automatically acquires hostile Swarmer, discharges autocannon, and damages it
+        harness.run_for_ticks(25);
+
+        let hostile_alive = harness.state().robot_registry.robots.contains_key(&hostile)
+            && harness
+                .state()
+                .robot_registry
+                .robots
+                .get(&hostile)
+                .unwrap()
+                .current_hp
+                > 0;
+        assert!(
+            !hostile_alive
+                || harness
+                    .state()
+                    .robot_registry
+                    .robots
+                    .get(&hostile)
+                    .unwrap()
+                    .current_hp
+                    < initial_hostile_hp,
+            "Turret must automatically engage and damage or eliminate approaching hostile swarm"
+        );
+    }
+
+    /// Proving Ground 7: Combat determinism across identical simulations.
+    #[test]
+    fn test_m13_combat_determinism_across_identical_simulations() {
+        fn run_battle() -> WorldState {
+            let mut harness = TestHarness::with_seed(1337);
+            let region = RegionId::new(1);
+            let f1 = FactionId::new(1);
+            let f2 = FactionId::new(2);
+
+            let r1 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Rifleman,
+                    f1,
+                    region,
+                    (0.0, 0.0, 0.0),
+                )
+                .unwrap();
+            let r2 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Grenadier,
+                    f1,
+                    region,
+                    (5.0, 0.0, 0.0),
+                )
+                .unwrap();
+            let e1 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Charger,
+                    f2,
+                    region,
+                    (35.0, 0.0, 0.0),
+                )
+                .unwrap();
+            let e2 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Spitter,
+                    f2,
+                    region,
+                    (30.0, 0.0, 5.0),
+                )
+                .unwrap();
+
+            let _ = harness.issue_robot_order(r1, crate::robot::RobotOrder::Attack { target: e1 });
+            let _ = harness.issue_robot_order(r2, crate::robot::RobotOrder::Attack { target: e2 });
+            let _ = harness.issue_robot_order(e1, crate::robot::RobotOrder::Attack { target: r1 });
+            let _ = harness.issue_robot_order(e2, crate::robot::RobotOrder::Attack { target: r2 });
+
+            harness.run_for_ticks(100);
+            harness.state().clone()
+        }
+
+        let sim_a = run_battle();
+        let sim_b = run_battle();
+        assert_eq!(
+            sim_a, sim_b,
+            "Identical combat battle runs must remain bit-for-bit identical"
+        );
     }
 }

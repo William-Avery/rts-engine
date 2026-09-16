@@ -550,3 +550,61 @@ impl fmt::Display for ChassisId {
         write!(f, "Chassis({})", self.0)
     }
 }
+
+/// Unique projectile identifier for simulated ballistics and attacks.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct ProjectileId(pub u64);
+
+impl ProjectileId {
+    pub const fn new(value: u64) -> Self {
+        ProjectileId(value)
+    }
+
+    pub const fn null() -> Self {
+        ProjectileId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ProjectileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Projectile({})", self.0)
+    }
+}
+
+/// Unique weapon identifier.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct WeaponId(pub u32);
+
+impl WeaponId {
+    pub const fn new(value: u32) -> Self {
+        WeaponId(value)
+    }
+
+    pub const fn null() -> Self {
+        WeaponId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for WeaponId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Weapon({})", self.0)
+    }
+}

@@ -1,3 +1,4 @@
+use crate::combat::{WeaponDef, WeaponState};
 use crate::event::{EventJournal, SimEvent};
 use crate::inventory::Inventory;
 use crate::logistics::{DepotLogistics, LogisticsDock, LogisticsManager};
@@ -8,7 +9,7 @@ use crate::wall::{DamageResult, DamageSpec, RepairResult, WallTier, calculate_wa
 use game_types::{
     DepositId, EntityId, FactionId, GameError, GameResult, RES_ADVANCED_COMPONENTS,
     RES_BASIC_COMPONENTS, RES_ENERGY_CELL, RES_STEEL, RES_STONE, RecipeId, RegionId, ResourceId,
-    SimTick, StructureId,
+    SimTick, StructureId, WeaponId,
 };
 use std::collections::BTreeMap;
 
@@ -269,6 +270,7 @@ pub struct Structure {
     pub state: StructureState,
     pub power_status: PowerStatus,
     pub creation_tick: SimTick,
+    pub weapon: Option<WeaponState>,
 }
 
 impl Structure {
@@ -285,6 +287,14 @@ impl Structure {
         let bounds_min = (position.0 - hx, position.1, position.2 - hz);
         let bounds_max = (position.0 + hx, position.1 + hy * 2.0, position.2 + hz);
 
+        let weapon = if kind == StructureKind::Turret {
+            Some(WeaponState::new(WeaponDef::new_turret_autocannon(
+                WeaponId(id.value() as u32),
+            )))
+        } else {
+            None
+        };
+
         Structure {
             id,
             kind,
@@ -297,6 +307,7 @@ impl Structure {
             state: StructureState::Planned,
             power_status: PowerStatus::NotRequired,
             creation_tick,
+            weapon,
         }
     }
 

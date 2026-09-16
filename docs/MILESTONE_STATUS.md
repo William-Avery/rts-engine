@@ -17,7 +17,7 @@ This file is maintained by the coding agent.
 | 10 | Mining, Refining, and Manufacturing | COMPLETE |
 | 11 | Logistics Jobs, Depots, Docks, Buffers, and Reservations | COMPLETE |
 | 12 | Basic Biped Robot Framework and Guardsman | COMPLETE |
-| 13 | Combat, Weapons, Damage, Armor, and Projectiles | NOT STARTED |
+| 13 | Combat, Weapons, Damage, Armor, and Projectiles | COMPLETE |
 | 14 | Sensors, Faction Knowledge, Fog, and Replication Interest | NOT STARTED |
 | 15 | Tactical and Strategic Camera Modes | NOT STARTED |
 | 16 | Hierarchical AI and Scalable Navigation | NOT STARTED |
@@ -251,5 +251,27 @@ For each milestone change, append:
     - Eliminated formulaic memory estimation guesswork in `sim-bench`.
     - Implemented live heap allocation tracking via custom `TrackingAllocator` global allocator wrapping `std::alloc::System`.
     - Updated all 10 benchmark scenarios to record real heap memory, reporting authentic footprint in human-readable tables and JSON reports.
+- Remaining debt: None
+- Blockers: None
+
+### Milestone 13 — Combat, Weapons, Damage, Armor, and Projectiles
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/game-types/src/ids.rs, crates/sim-core/src/combat.rs, crates/sim-core/src/wall.rs, crates/sim-core/src/chassis.rs, crates/sim-core/src/robot.rs, crates/sim-core/src/structure.rs, crates/sim-core/src/world.rs, crates/sim-core/src/event.rs, crates/anti-cheat/src/world_view.rs, crates/sim-core/src/test_harness.rs, docs/MILESTONE_STATUS.md
+- Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, and `cargo run -p sim-bench --release` all pass cleanly with zero warnings.
+- Tests: 331 tests pass across workspace (164 in sim-core, 105 in anti-cheat, 33 in game-protocol, 18 in game-client, 11 in game-types).
+- Proving Ground Scenarios:
+  - `test_m13_rifleman_attacks_enemy_linear_projectiles_and_damage`: Linear ballistic kinematics, hit registration, journal event logging, and wall/chassis kinetic damage mitigation.
+  - `test_m13_grenadier_ballistic_arc_and_splash_aoe_falloff`: Parabolic gravity trajectory integration, radial splash distance falloff calculation ($1 - d/R$), and collateral bystander damage.
+  - `test_m13_swarmer_melee_and_charger_momentum_ram`: Melee mandible bite strikes at close range and high-mass Charger kinetic ramming damage calculated from $m \cdot v \cdot c$.
+  - `test_m13_spitter_corrosive_acid_armor_strip_and_dot`: Corrosive damage armor bypass (+50%), flat armor degradation status debuffs, and tick-based DoT processing.
+  - `test_m13_anti_armor_railgun_heavy_penetration`: Hyper-velocity linear railgun slugs bypassing heavy composite armor plates with zero mitigation.
+  - `test_m13_turret_automated_point_defense_and_power_dependency`: Operational defensive turrets acquiring targets automatically when powered and cycling point-defense autocannons.
+  - `test_m13_combat_determinism_across_identical_simulations`: Full multi-unit battle running identically across separate runs with bit-for-bit identical final world state.
+- Architecture: Decoupled orthogonal combat primitives:
+  - `MotionPrimitive`: `Linear`, `Ballistic`, `Hitscan`, `Guided`, `Beam`, `PhysicalMelee`, `AreaField`.
+  - `DamageKind`: `Kinetic`, `Explosive`, `Thermal`, `Energy`, `Corrosive`, `Electrical`, `Impact`.
+  - `CombatEffect`: `DamageOverTime`, `ArmorDegradation`, `Slow`, `StunEmp`, `Knockback`, `Suppression`.
 - Remaining debt: None
 - Blockers: None

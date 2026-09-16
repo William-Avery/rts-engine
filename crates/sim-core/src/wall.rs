@@ -1,3 +1,4 @@
+use crate::combat::{CombatEffect, DamageKind};
 use game_types::{
     EntityId, RES_REPAIR_KIT, RES_STEEL, RES_STONE, RES_TUNGSTEN_COMPOSITE, ResourceId,
 };
@@ -114,12 +115,14 @@ pub static MK3_COMPOSITE_ARCHETYPE: WallArchetype = WallArchetype {
     repair_hp_per_unit: 250.0,
 };
 
-/// Parameters specifying damage applied to a structure.
+/// Parameters specifying damage applied to an entity or structure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DamageSpec {
     pub raw_damage: f32,
     pub armor_penetration: f32,
     pub source: Option<EntityId>,
+    pub damage_kind: DamageKind,
+    pub effect: Option<CombatEffect>,
 }
 
 impl DamageSpec {
@@ -128,6 +131,8 @@ impl DamageSpec {
             raw_damage,
             armor_penetration: 0.0,
             source: None,
+            damage_kind: DamageKind::Kinetic,
+            effect: None,
         }
     }
 
@@ -138,6 +143,37 @@ impl DamageSpec {
 
     pub const fn with_source(mut self, source: EntityId) -> Self {
         self.source = Some(source);
+        self
+    }
+
+    pub const fn with_kind(mut self, damage_kind: DamageKind) -> Self {
+        self.damage_kind = damage_kind;
+        self
+    }
+
+    pub const fn with_effect(mut self, effect: CombatEffect) -> Self {
+        self.effect = Some(effect);
+        self
+    }
+
+    /// Calculate impact damage from mass and velocity: Damage = mass * velocity * coeff.
+    pub fn new_impact(mass_kg: f32, relative_speed: f32, impact_coeff: f32) -> Self {
+        let raw = mass_kg * relative_speed * impact_coeff;
+        let penetration = (raw * 0.1).min(30.0);
+        DamageSpec {
+            raw_damage: raw,
+            armor_penetration: penetration,
+            source: None,
+            damage_kind: DamageKind::Impact,
+            effect: Some(CombatEffect::Knockback {
+                impulse: (0.0, 0.0, relative_speed * 0.5),
+            }),
+        }
+    }
+
+    /// Return a copy with raw damage scaled by a factor (e.g. for radial splash falloff).
+    pub fn scaled(mut self, scale: f32) -> Self {
+        self.raw_damage *= scale.max(0.0);
         self
     }
 }
@@ -187,7 +223,14 @@ impl WallArchetype {
 
 /// Authoritative calculation of damage mitigation against any armor profile.
 pub fn calculate_damage(armor: ArmorProfile, current_hp: u32, damage: DamageSpec) -> DamageResult {
-    let effective_armor = (armor.flat_armor - damage.armor_penetration).max(0.0);
+    // Energy and corrosive attacks ignore 50% of the target's flat armor plating
+    let effective_penetration = match damage.damage_kind {
+        DamageKind::Energy | DamageKind::Corrosive => {
+            damage.armor_penetration + (armor.flat_armor * 0.5)
+        }
+        _ => damage.armor_penetration,
+    };
+    let effective_armor = (armor.flat_armor - effective_penetration).max(0.0);
     let post_armor = (damage.raw_damage - effective_armor).max(0.0);
     let absorbed_armor = damage.raw_damage - post_armor;
     let effective_damage = post_armor * (1.0 - armor.damage_reduction);
