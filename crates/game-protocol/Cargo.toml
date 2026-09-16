@@ -3,6 +3,12 @@ name = "game-protocol"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Forwards to `anti-cheat/eos-eac`. Off by default; see docs/SECURITY.md.
+eos-eac = ["anti-cheat/eos-eac"]
+
 [dependencies]
+anti-cheat = { path = "../anti-cheat" }
 game-types = { path = "../game-types" }
 sim-core = { path = "../sim-core" }

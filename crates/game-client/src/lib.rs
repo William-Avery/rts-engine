@@ -9,7 +9,8 @@ pub mod placement;
 pub mod power_view;
 pub mod prediction;
 pub mod presentation;
-pub mod terrain;
+pub mod research_view;
+pub mod robot_view;
 pub mod wall_batch;
 
 pub use avatar::*;
@@ -23,8 +24,15 @@ pub use placement::*;
 pub use power_view::*;
 pub use prediction::*;
 pub use presentation::*;
-pub use terrain::*;
+pub use research_view::*;
+pub use robot_view::*;
 pub use wall_batch::*;
+
+/// The authoritative collision world and movement validator live in `sim-core`.
+/// The client re-exports them so prediction and the server run identical code.
+pub use sim_core::terrain::{
+    GreyboxTerrain, MovementConfig, ObstacleAabb, validate_authoritative_movement,
+};
 
 #[cfg(test)]
 mod tests {
@@ -533,5 +541,135 @@ mod tests {
         let card = hud.render_ascii_card();
         assert!(card.contains("Power:   100 kW Gen"));
         assert!(card.contains("Battery Buffer:"));
+    }
+    #[test]
+    fn test_research_view_reflects_tree_queue_and_modifier_state() {
+        use sim_core::modifier::{ModifierGroup, ModifierKind};
+        use sim_core::research::{
+            ResearchJobState, ResearchManager, TECH_BASIC_METALLURGY, TECH_POWER_REGULATION,
+            TECH_TUNGSTEN_PROCESSING,
+        };
+
+        let faction = game_types::FactionId::new(1);
+        let mut research = ResearchManager::new();
+        let mut journal = sim_core::event::EventJournal::new();
+
+        // Nothing researched yet: roots are available, deep techs are locked.
+        let snapshot = ResearchViewSnapshot::extract(&research, faction);
+        assert_eq!(snapshot.telemetry.completed_techs, 0);
+        assert!(snapshot.telemetry.total_techs > 0);
+        assert!(snapshot.telemetry.available_techs > 0);
+        assert!(snapshot.telemetry.locked_techs > 0);
+        assert!(snapshot.modifiers.is_empty());
+        let tungsten = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.tech_id == TECH_TUNGSTEN_PROCESSING)
+            .unwrap();
+        assert_eq!(tungsten.state, TechNodeState::Locked);
+
+        // Complete one technology and queue another.
+        research
+            .grant_tech(
+                faction,
+                TECH_BASIC_METALLURGY,
+                SimTick::zero(),
+                &mut journal,
+            )
+            .unwrap();
+        research
+            .queue_research(
+                faction,
+                TECH_POWER_REGULATION,
+                SimTick::zero(),
+                &mut journal,
+            )
+            .unwrap();
+
+        let snapshot = ResearchViewSnapshot::extract(&research, faction);
+        assert_eq!(snapshot.telemetry.completed_techs, 1);
+        assert_eq!(snapshot.telemetry.queued_jobs, 1);
+        assert_eq!(snapshot.telemetry.active_tech, Some(TECH_POWER_REGULATION));
+        assert_eq!(snapshot.queue[0].state, ResearchJobState::Queued);
+        assert_eq!(snapshot.queue[0].position, 0);
+
+        let metallurgy = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.tech_id == TECH_BASIC_METALLURGY)
+            .unwrap();
+        assert_eq!(metallurgy.state, TechNodeState::Completed);
+        assert_eq!(metallurgy.color_rgba, (0.1, 0.95, 0.2, 1.0));
+
+        let power = snapshot
+            .nodes
+            .iter()
+            .find(|n| n.tech_id == TECH_POWER_REGULATION)
+            .unwrap();
+        assert_eq!(power.state, TechNodeState::Queued);
+
+        // The completed technology's software patch is surfaced with a breakdown.
+        let refining = snapshot
+            .modifiers
+            .iter()
+            .find(|m| m.kind == ModifierKind::RefiningSpeed)
+            .unwrap();
+        assert_eq!(refining.multiplier_milli, 1100);
+        assert!((refining.percent_delta - 10.0).abs() < 0.001);
+        assert_eq!(
+            refining.breakdown,
+            vec![(ModifierGroup::SoftwarePatch, 100)]
+        );
+        assert_eq!(
+            snapshot.telemetry.active_modifier_count,
+            snapshot.modifiers.len()
+        );
+    }
+
+    #[test]
+    fn test_research_view_ascii_reports_render() {
+        use sim_core::research::{ResearchManager, TECH_BASIC_METALLURGY};
+
+        let faction = game_types::FactionId::new(1);
+        let mut research = ResearchManager::new();
+        let mut journal = sim_core::event::EventJournal::new();
+        research
+            .grant_tech(
+                faction,
+                TECH_BASIC_METALLURGY,
+                SimTick::zero(),
+                &mut journal,
+            )
+            .unwrap();
+
+        let snapshot = ResearchViewSnapshot::extract(&research, faction);
+
+        let report = snapshot.render_ascii_report();
+        assert!(report.contains("RESEARCH NETWORK STATUS"));
+        assert!(report.contains("Refining Speed"));
+        assert!(report.contains("Modifier Patch"));
+
+        let tree = snapshot.render_ascii_tree();
+        assert!(tree.contains("TECH TREE"));
+        assert!(tree.contains("Basic Metallurgy"));
+        assert!(tree.contains("COMPLETE"));
+        assert!(snapshot.max_tier() >= 1);
+        assert!(!snapshot.nodes_in_tier(1).is_empty());
+    }
+
+    #[test]
+    fn test_debug_hud_renders_research_telemetry() {
+        let hud = DebugHud {
+            research_techs_total: 14,
+            research_techs_completed: 3,
+            research_queue_depth: 2,
+            research_active_progress: 0.5,
+            research_active_modifiers: 4,
+            ..Default::default()
+        };
+
+        let out = hud.render_ascii_card();
+        assert!(out.contains("Research:"));
+        assert!(out.contains("Active Software Patches"));
     }
 }

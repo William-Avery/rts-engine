@@ -1,11 +1,20 @@
 use crate::packet::{Packet, PacketPayload};
-use crate::session::Session;
+use crate::server::{
+    BindingOutcome, DEFAULT_SESSION_FACTION, apply_buffered_commands, bind_command_packet,
+};
+use crate::session::{Session, TokenIssuer};
 use crate::snapshot::{EntitySnapshot, SnapshotEnvelope};
 use crate::transport::{TransportRecv, TransportSend};
 use crate::version::{HandshakeMessage, PROTOCOL_VERSION};
-use game_types::{SessionId, SimTick};
-use sim_core::test_harness::TestSimState;
+use anti_cheat::admin::{AdminRegistry, AdminRole, required_admin_permission};
+use anti_cheat::event::{SecurityEvent, SecurityEventKind};
+use anti_cheat::manifest::{BuildManifest, ServerPolicy};
+use anti_cheat::provider::{AntiCheatMode, AntiCheatProvider, InspectionContext, Verdict};
+use anti_cheat::trust::TrustLevel;
+use game_types::{PlayerId, SessionId, SimTick};
+use sim_core::world::{SessionDirective, WorldState};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -13,6 +22,25 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Security state owned by the simulation thread.
+///
+/// Bundled into one struct so the packet-processing function keeps a sane
+/// parameter count and so the anti-cheat provider never crosses a thread
+/// boundary.
+struct ServerSecurity {
+    anti_cheat: Box<dyn AntiCheatProvider>,
+    admin_registry: AdminRegistry,
+    server_policy: ServerPolicy,
+    build_manifest: BuildManifest,
+    commands_blocked: u64,
+    /// Commands the simulation itself refused during dispatch.
+    commands_rejected: u64,
+    /// Issuer of per-session capability tokens. Deliberately not the
+    /// simulation RNG: tokens must be unpredictable and must not perturb
+    /// deterministic replay.
+    tokens: TokenIssuer,
+}
 
 /// A lightweight, thread-safe worker pool for parallel computations (snapshot encoding, route planning, background simulation tasks).
 pub struct WorkerPool {
@@ -98,6 +126,12 @@ pub struct ThreadedServerConfig {
     pub worker_threads: usize,
     /// Timeout in simulation ticks before inactive sessions are disconnected (e.g. 150 ticks = 5s at 30Hz).
     pub timeout_ticks: u64,
+    /// Which anti-cheat provider to install. Defaults to disabled.
+    pub anti_cheat: AntiCheatMode,
+    /// Build/protocol/content manifest policy this server enforces.
+    pub server_policy: ServerPolicy,
+    /// The server's own build manifest, advertised to and compared against clients.
+    pub build_manifest: BuildManifest,
 }
 
 impl Default for ThreadedServerConfig {
@@ -106,6 +140,9 @@ impl Default for ThreadedServerConfig {
             tick_rate_hz: 30,
             worker_threads: 4,
             timeout_ticks: 150,
+            anti_cheat: AntiCheatMode::Disabled,
+            server_policy: ServerPolicy::LocalDev,
+            build_manifest: BuildManifest::new("rts-engine-dev", PROTOCOL_VERSION, 0),
         }
     }
 }
@@ -202,7 +239,7 @@ impl ThreadedAuthoritativeServer {
         sender: S,
         receiver: R,
         config: ThreadedServerConfig,
-        initial_sim_state: Option<TestSimState>,
+        initial_sim_state: Option<WorldState>,
     ) -> ServerHandle
     where
         S: TransportSend + 'static,
@@ -288,6 +325,22 @@ impl ThreadedAuthoritativeServer {
                 let mut next_session_id = 1u64;
                 let mut last_broadcast_seq = 0u64;
                 let timeout_ticks = config.timeout_ticks;
+                // The anti-cheat provider is owned by the simulation thread, so
+                // inspection runs on the same thread as authoritative state and
+                // needs no locking.
+                let mut security = ServerSecurity {
+                    anti_cheat: config.anti_cheat.create_provider(
+                        config.server_policy.clone(),
+                        config.build_manifest.clone(),
+                    ),
+                    admin_registry: AdminRegistry::new(),
+                    server_policy: config.server_policy.clone(),
+                    build_manifest: config.build_manifest.clone(),
+                    commands_blocked: 0,
+                    commands_rejected: 0,
+                    tokens: TokenIssuer::new(),
+                };
+                let _ = security.anti_cheat.initialize();
 
                 while sim_running.load(Ordering::Relaxed) {
                     let tick_start = Instant::now();
@@ -301,6 +354,7 @@ impl ThreadedAuthoritativeServer {
                             &mut next_session_id,
                             &mut last_broadcast_seq,
                             &outbound_tx,
+                            &mut security,
                         );
                     }
 
@@ -308,32 +362,41 @@ impl ThreadedAuthoritativeServer {
                     sim_state.tick = sim_state.tick.next();
                     sim_current_tick.store(sim_state.tick.value(), Ordering::Relaxed);
 
-                    // Step C: Apply simulation commands
-                    Self::apply_commands(&mut sim_state);
+                    // Step C: Apply simulation commands through the one
+                    // dispatcher `AuthoritativeServer` and the test harness use.
+                    let stats = apply_buffered_commands(
+                        &mut sim_state,
+                        &sessions,
+                        &security.admin_registry,
+                    );
+                    security.commands_rejected += stats.rejected;
+
+                    // Step C2: Carry out the session-layer actions the
+                    // simulation authorized.
+                    for directive in sim_state.drain_session_directives() {
+                        Self::execute_session_directive(directive, &mut sessions, &mut security);
+                    }
 
                     // Step D: Step systems
-                    sim_state
-                        .structure_registry
-                        .tick_with_journal(sim_state.tick, &mut sim_state.event_journal);
-
-                    sim_state.structure_registry.logistics.step(
-                        sim_state.tick,
-                        &mut sim_state.inventory_registry,
-                        &mut sim_state.event_journal,
-                    );
-
-                    sim_state.scheduler.tick(
-                        sim_state.tick,
-                        &mut sim_state.region_map,
-                        &mut sim_state.router,
-                    );
+                    sim_state.step_systems();
 
                     // Step E: Session timeout check
                     let current_tk = sim_state.tick;
                     for session in sessions.values_mut() {
                         if session.is_timed_out(current_tk, timeout_ticks) {
                             session.disconnect();
+                            security.anti_cheat.end_session(session.player_id);
+                            security.admin_registry.remove_session(session.session_id);
                         }
+                    }
+
+                    // Step E2: Service anti-cheat and apply pending enforcement.
+                    security.anti_cheat.poll();
+                    for (session_id, _reason) in security.anti_cheat.drain_pending_kicks() {
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.disconnect();
+                        }
+                        security.admin_registry.remove_session(session_id);
                     }
 
                     // Step F: Broadcast snapshots
@@ -374,13 +437,44 @@ impl ThreadedAuthoritativeServer {
         }
     }
 
+    /// Carry out one session-layer action the simulation authorized.
+    fn execute_session_directive(
+        directive: SessionDirective,
+        sessions: &mut BTreeMap<SessionId, Session>,
+        security: &mut ServerSecurity,
+    ) {
+        match directive {
+            SessionDirective::KickSession { target, .. } => {
+                if let Some(session) = sessions.get_mut(&target) {
+                    session.disconnect();
+                    security.anti_cheat.end_session(session.player_id);
+                }
+                security.anti_cheat.end_session_by_id(target);
+                security.admin_registry.remove_session(target);
+            }
+            SessionDirective::SetTrustLevel { target, trust_code } => {
+                if let Some(level) = TrustLevel::from_code(trust_code) {
+                    security
+                        .anti_cheat
+                        .apply_admin_trust_override(target, level);
+                }
+            }
+            SessionDirective::SetSessionRole { target, role_code } => {
+                if let Some(role) = AdminRole::from_code(role_code) {
+                    security.admin_registry.set_role(target, role);
+                }
+            }
+        }
+    }
+
     fn process_inbound_packet(
         packet: Packet,
-        sim_state: &mut TestSimState,
+        sim_state: &mut WorldState,
         sessions: &mut BTreeMap<SessionId, Session>,
         next_session_id: &mut u64,
         last_broadcast_seq: &mut u64,
         outbound_tx: &Sender<Packet>,
+        security: &mut ServerSecurity,
     ) {
         match packet.payload {
             PacketPayload::Handshake(handshake) => match handshake {
@@ -400,6 +494,7 @@ impl ThreadedAuthoritativeServer {
                                 reject_reason: Some(format!(
                                     "Incompatible protocol version. Server: {PROTOCOL_VERSION}, Client: {protocol_version}"
                                 )),
+                                session_token: 0,
                             },
                         );
                         let _ = outbound_tx.send(response);
@@ -407,9 +502,44 @@ impl ThreadedAuthoritativeServer {
                     }
 
                     let session_id = SessionId::new(*next_session_id);
+                    let player_id = PlayerId::new(*next_session_id as u32);
                     *next_session_id += 1;
+                    let source: Option<SocketAddr> = None;
 
-                    let mut session = Session::new(session_id, client_name, sim_state.tick);
+                    if security
+                        .anti_cheat
+                        .on_client_connecting(session_id, &client_name)
+                        .is_err()
+                        || security
+                            .anti_cheat
+                            .begin_session(player_id, session_id)
+                            .is_err()
+                    {
+                        let response = Packet::new_handshake(
+                            SessionId::null(),
+                            *last_broadcast_seq,
+                            HandshakeMessage::ServerHello {
+                                accepted: false,
+                                session_id: SessionId::null(),
+                                server_tick: sim_state.tick,
+                                reject_reason: Some("Refused by anti-cheat provider".to_string()),
+                                session_token: 0,
+                            },
+                        );
+                        let _ = outbound_tx.send(response);
+                        return;
+                    }
+                    security.anti_cheat.on_client_authenticated(
+                        session_id,
+                        player_id,
+                        DEFAULT_SESSION_FACTION,
+                        sim_state.tick,
+                    );
+
+                    let token = security.tokens.next_token();
+                    let mut session = Session::new(session_id, client_name, sim_state.tick)
+                        .with_identity(player_id, DEFAULT_SESSION_FACTION)
+                        .with_binding(token, source);
                     session.activate();
                     sessions.insert(session_id, session);
 
@@ -421,6 +551,7 @@ impl ThreadedAuthoritativeServer {
                             session_id,
                             server_tick: sim_state.tick,
                             reject_reason: None,
+                            session_token: token,
                         },
                     );
                     let _ = outbound_tx.send(response);
@@ -428,7 +559,9 @@ impl ThreadedAuthoritativeServer {
                 HandshakeMessage::Disconnect { session_id, .. } => {
                     if let Some(session) = sessions.get_mut(&session_id) {
                         session.disconnect();
+                        security.anti_cheat.end_session(session.player_id);
                     }
+                    security.admin_registry.remove_session(session_id);
                 }
                 _ => {}
             },
@@ -436,11 +569,116 @@ impl ThreadedAuthoritativeServer {
                 let session_id = envelope.session_id;
                 let sequence = envelope.sequence;
 
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.update_heartbeat(sim_state.tick);
-                    if session.validate_and_advance_sequence(sequence).is_ok() {
-                        sim_state.add_command(envelope);
+                // Session binding runs first: a packet that cannot prove it
+                // owns the session must not be able to touch its heartbeat or
+                // latch its sequence counter.
+                if let BindingOutcome::Rejected(kind) =
+                    bind_command_packet(sessions, &envelope, None)
+                {
+                    security.commands_blocked += 1;
+                    security.anti_cheat.report_event(SecurityEvent::new(
+                        session_id,
+                        PlayerId::null(),
+                        sim_state.tick,
+                        kind,
+                    ));
+                    return;
+                }
+
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    return;
+                };
+                session.update_heartbeat(sim_state.tick);
+                if session.validate_and_advance_sequence(sequence).is_err() {
+                    return;
+                }
+                let player_id = session.player_id;
+                let faction_id = session.faction_id;
+                let manifest_verified = session.manifest_verified;
+
+                if let sim_core::command::Command::SubmitClientManifest {
+                    build_id,
+                    protocol_version,
+                    content_hash,
+                    official_build,
+                } = &envelope.command
+                {
+                    let client_manifest = BuildManifest {
+                        build_id: build_id.clone(),
+                        protocol_version: *protocol_version,
+                        content_hash: *content_hash,
+                        official: *official_build,
+                    };
+                    let accepted = security
+                        .anti_cheat
+                        .verify_client_manifest(session_id, &client_manifest)
+                        .is_ok()
+                        && security
+                            .server_policy
+                            .validate(&security.build_manifest, &client_manifest)
+                            .is_ok();
+                    if accepted {
+                        session.manifest_verified = true;
+                    } else {
+                        session.disconnect();
+                        security.commands_blocked += 1;
+                        security.anti_cheat.report_event(SecurityEvent::new(
+                            session_id,
+                            player_id,
+                            sim_state.tick,
+                            SecurityEventKind::ManifestMismatch {
+                                expected: security.build_manifest.manifest_hash(),
+                                actual: client_manifest.manifest_hash(),
+                            },
+                        ));
                     }
+                    return;
+                }
+
+                if let Some(permission) = required_admin_permission(&envelope.command)
+                    && security
+                        .admin_registry
+                        .authorize(session_id, permission)
+                        .is_err()
+                {
+                    security.commands_blocked += 1;
+                    security.anti_cheat.report_event(SecurityEvent::new(
+                        session_id,
+                        player_id,
+                        sim_state.tick,
+                        SecurityEventKind::AdminPermissionDenied { permission },
+                    ));
+                    return;
+                }
+
+                if security.server_policy.requires_manifest() && !manifest_verified {
+                    security.commands_blocked += 1;
+                    return;
+                }
+
+                let verdict = {
+                    let ctx = InspectionContext::new(
+                        session_id,
+                        player_id,
+                        faction_id,
+                        sim_state.tick,
+                        envelope.client_tick,
+                        sequence,
+                        sim_state,
+                    );
+                    security.anti_cheat.inspect_command(&ctx, &envelope.command)
+                };
+
+                if verdict.allows_command() {
+                    sim_state.add_command(envelope);
+                } else {
+                    security.commands_blocked += 1;
+                }
+
+                if matches!(verdict, Verdict::Kick(_))
+                    && let Some(session) = sessions.get_mut(&session_id)
+                {
+                    session.disconnect();
                 }
             }
             PacketPayload::Ping { timestamp } => {
@@ -457,158 +695,8 @@ impl ThreadedAuthoritativeServer {
         }
     }
 
-    fn apply_commands(sim_state: &mut TestSimState) {
-        while let Some(envelope) = sim_state.command_buffer.pop() {
-            match envelope.command {
-                sim_core::command::Command::TransferRegion {
-                    entity_id,
-                    destination_region,
-                } => {
-                    let _ = sim_state.transfer_entity(entity_id, destination_region);
-                }
-                sim_core::command::Command::BuildStructure {
-                    kind,
-                    position,
-                    rotation_deg,
-                } => {
-                    let _ = sim_state.structure_registry.request_build(
-                        sim_core::structure::BuildRequest {
-                            player_pos: position,
-                            requested_pos: position,
-                            kind,
-                            rotation_deg,
-                            faction_id: game_types::FactionId::new(1),
-                            region_id: game_types::RegionId::new(1),
-                            creation_tick: sim_state.tick,
-                            world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
-                        },
-                        None,
-                    );
-                }
-                sim_core::command::Command::DismantleStructure { structure_id } => {
-                    let _ = sim_state
-                        .structure_registry
-                        .request_dismantle(structure_id, game_types::FactionId::new(1));
-                }
-                sim_core::command::Command::RepairStructure {
-                    structure_id,
-                    actor_entity: Some(actor),
-                } => {
-                    let _ = sim_state.repair_structure(structure_id, actor);
-                }
-                sim_core::command::Command::TransferResource {
-                    from_entity,
-                    to_entity,
-                    resource_id,
-                    amount,
-                } => {
-                    let _ =
-                        sim_state.transfer_resources(from_entity, to_entity, resource_id, amount);
-                }
-                sim_core::command::Command::ReserveResource {
-                    entity,
-                    resource_id,
-                    amount,
-                    reservation_id,
-                } => {
-                    let _ = sim_state.reserve_resources(
-                        entity,
-                        reservation_id,
-                        resource_id,
-                        amount,
-                        None,
-                    );
-                }
-                sim_core::command::Command::CommitTransfer {
-                    reservation_id,
-                    from_entity,
-                    to_entity,
-                } => {
-                    let _ =
-                        sim_state.commit_resource_transfer(reservation_id, from_entity, to_entity);
-                }
-                sim_core::command::Command::CancelReservation {
-                    reservation_id,
-                    from_entity,
-                } => {
-                    let _ = sim_state.cancel_resource_reservation(reservation_id, from_entity);
-                }
-                sim_core::command::Command::SetProductionRecipe {
-                    structure_id,
-                    recipe_id,
-                } => {
-                    let _ = sim_state
-                        .structure_registry
-                        .set_production_recipe(structure_id, recipe_id);
-                }
-                sim_core::command::Command::SetExtractionTarget {
-                    structure_id,
-                    deposit_id,
-                } => {
-                    let _ = sim_state
-                        .structure_registry
-                        .set_extraction_target(structure_id, deposit_id);
-                }
-                sim_core::command::Command::CreateLogisticsJob {
-                    source,
-                    destination,
-                    resource_id,
-                    amount,
-                    priority,
-                } => {
-                    let _ = sim_state.structure_registry.logistics.create_job(
-                        source,
-                        destination,
-                        resource_id,
-                        amount,
-                        sim_core::logistics::JobPriority::from_u8(priority),
-                        sim_state.tick,
-                        &mut sim_state.event_journal,
-                    );
-                }
-                sim_core::command::Command::CancelLogisticsJob { job_id } => {
-                    let _ = sim_state.structure_registry.logistics.cancel_job(
-                        job_id,
-                        "Server command cancelled",
-                        sim_state.tick,
-                        &mut sim_state.inventory_registry,
-                        &mut sim_state.event_journal,
-                    );
-                }
-                sim_core::command::Command::ClaimLogisticsJob { job_id, worker_id } => {
-                    let _ = sim_state.structure_registry.logistics.claim_job(
-                        job_id,
-                        worker_id,
-                        sim_state.tick,
-                        &mut sim_state.inventory_registry,
-                        &mut sim_state.event_journal,
-                    );
-                }
-                sim_core::command::Command::ExecuteLogisticsPickup { job_id, worker_id } => {
-                    let _ = sim_state.structure_registry.logistics.execute_pickup(
-                        job_id,
-                        worker_id,
-                        sim_state.tick,
-                        &mut sim_state.inventory_registry,
-                        &mut sim_state.event_journal,
-                    );
-                }
-                sim_core::command::Command::ExecuteLogisticsDropoff { job_id, worker_id } => {
-                    let _ = sim_state.structure_registry.logistics.execute_dropoff(
-                        job_id,
-                        worker_id,
-                        sim_state.tick,
-                        &mut sim_state.inventory_registry,
-                        &mut sim_state.event_journal,
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
     fn broadcast_snapshots(
-        sim_state: &TestSimState,
+        sim_state: &WorldState,
         sessions: &BTreeMap<SessionId, Session>,
         last_broadcast_seq: &mut u64,
         outbound_tx: &Sender<Packet>,

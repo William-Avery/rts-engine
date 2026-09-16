@@ -16,20 +16,20 @@ This file is maintained by the coding agent.
 | 9 | Power Network | COMPLETE |
 | 10 | Mining, Refining, and Manufacturing | COMPLETE |
 | 11 | Logistics Jobs, Depots, Docks, Buffers, and Reservations | COMPLETE |
-| 12 | Basic Biped Robot Framework and Guardsman | NOT STARTED |
+| 12 | Basic Biped Robot Framework and Guardsman | COMPLETE |
 | 13 | Combat, Weapons, Damage, Armor, and Projectiles | NOT STARTED |
 | 14 | Sensors, Faction Knowledge, Fog, and Replication Interest | NOT STARTED |
 | 15 | Tactical and Strategic Camera Modes | NOT STARTED |
 | 16 | Hierarchical AI and Scalable Navigation | NOT STARTED |
 | 17 | Defensive Structures | NOT STARTED |
 | 18 | Specialist Robots | NOT STARTED |
-| 19 | Research Facilities and Software-Patch Upgrades | NOT STARTED |
+| 19 | Research Facilities and Software-Patch Upgrades | COMPLETE |
 | 20 | Threat Director and Dynamic Assaults | NOT STARTED |
 | 21 | Downed State, Reinforcements, Forward Relays, and Last Stand | NOT STARTED |
 | 22 | Persistent Character Loadouts and Doctrine Progression | NOT STARTED |
 | 23 | Persistence, Snapshots, Journal, Replays, Crash Recovery | NOT STARTED |
 | 24 | Multiplayer Robustness | NOT STARTED |
-| 25 | Basic Anti-Cheat and EAC Integration Boundary | NOT STARTED |
+| 25 | Basic Anti-Cheat and EAC Integration Boundary | COMPLETE |
 | 26 | Vehicles, Air Logistics, and Later-Game Drones | NOT STARTED |
 | 27 | Endgame Strategic Command Array | NOT STARTED |
 | 28 | Scale, Optimization, and Soak Testing | NOT STARTED |
@@ -181,6 +181,52 @@ For each milestone change, append:
 - Remaining debt: None
 - Blockers: None
 
+### Milestone 12 — Basic Biped Robot Framework and Guardsman
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/game-types/src/ids.rs, crates/game-types/src/error.rs, crates/sim-core/src/robot.rs, crates/sim-core/src/navigation.rs, crates/sim-core/src/chassis.rs, crates/sim-core/src/wall.rs, crates/sim-core/src/command.rs, crates/sim-core/src/event.rs, crates/sim-core/src/test_harness.rs, crates/sim-core/src/lib.rs, crates/game-protocol/src/codec.rs, crates/game-protocol/src/server.rs, crates/game-protocol/src/threaded.rs, crates/game-protocol/src/lib.rs, crates/game-client/src/robot_view.rs, crates/game-client/src/lib.rs, tools/sim-bench/src/scenarios.rs, tools/sim-bench/src/main.rs, docs/DECISIONS.md, docs/BENCHMARKS.md, docs/MILESTONE_STATUS.md
+- Validation: cargo fmt --all -- --check, cargo check --workspace, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace all pass; dedicated-server --dry-run starts and shuts down cleanly
+- Tests: 135 tests pass across workspace (23 in game-client, 11 in game-protocol, 8 in game-types, 93 in sim-core). Acceptance mapping: `test_acceptance_guardsman_follows_player_without_blocking_movement` (follow/standoff/separation), `test_acceptance_escort_assignment_cannot_be_forged_by_another_player` plus `test_server_rejects_forged_escort_assignment_over_the_wire` (server authority), `test_acceptance_multiple_players_hold_independent_escorts_with_cap` (multiple simultaneous escorts + cap), `test_acceptance_robot_simulation_runs_headless_and_deterministically` plus `test_headless_harness_ticks_escorted_guardsman_through_commands` (headless simulation)
+- Benchmarks: Scenario 9 `robots_1k` runs 1,000 bipeds (16 escorts across 8 commanders, 40 regrouping squads) across 16 hot regions in 158.871 ms debug (2,647.85 µs/tick, ~378 ticks/sec) and 32.267 ms release (537.78 µs/tick, ~1,860 ticks/sec, ~62x the 30 Hz budget) in 104 KB
+- Decisions: Decision 25 (Data-Driven Biped Robot Chassis, Server-Authoritative Escort Ownership, and the Swappable Navigation Boundary)
+- Remaining debt: `RobotOrder::Attack` only resolves engagement positioning; weapon fire, projectiles, and target acquisition are Milestone 13. `DirectSteering` is intentionally local-only with no static-obstacle or terrain awareness — Milestone 16 replaces it behind the `NavigationProvider` trait. Robot production (build cost/power/ticks) is present as archetype data but is not yet wired to fabricator recipes.
+- Blockers: None
 
+### Milestone 19 — Research Facilities and Software-Patch Upgrades
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/game-types/src/ids.rs, crates/game-types/src/error.rs, crates/sim-core/src/modifier.rs, crates/sim-core/src/research.rs, crates/sim-core/src/structure.rs, crates/sim-core/src/power.rs, crates/sim-core/src/production.rs, crates/sim-core/src/logistics.rs, crates/sim-core/src/event.rs, crates/sim-core/src/command.rs, crates/sim-core/src/lib.rs, crates/sim-core/src/test_harness.rs, crates/game-protocol/src/codec.rs, crates/game-protocol/src/server.rs, crates/game-protocol/src/threaded.rs, crates/game-protocol/src/lib.rs, crates/game-client/src/research_view.rs, crates/game-client/src/hud.rs, crates/game-client/src/lib.rs, tools/sim-bench/src/scenarios.rs, tools/sim-bench/src/main.rs, docs/DECISIONS.md, docs/BENCHMARKS.md, docs/MILESTONE_STATUS.md
+- Validation: cargo fmt --all -- --check, cargo check --workspace, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace all pass; `cargo run -p dedicated-server -- --dry-run` starts all threads, processes ticks (including the research subsystem), and shuts down cleanly
+- Tests: 143 tests pass across workspace (21 in game-client, 11 in game-protocol, 8 in game-types, 103 in sim-core)
+- Benchmarks: Scenario 9 `research_modifiers_1k` runs 500 powered research laboratories + 500 generators across 64 factions and 16 regions for 300 ticks in 466.833 ms (1556.11 µs/tick, ~643 ticks/sec, 104 KB), queueing 128 research jobs, starting 128 and completing 128 while performing 102,400 faction-wide modifier evaluations; the same scenario measures 245.34 µs/tick (~4,076 ticks/sec) under `--release`
+- Acceptance evidence:
+  - Deterministic modifier stacking: `modifier::tests::test_acceptance_modifier_stacking_is_order_independent` (every rotation of the insertion order produces bit-identical `multiplier_milli`, `value_for_milli` and `value_for` float bits, plus pinned exact expected values), `modifier::tests::test_reversed_insertion_matches_forward_insertion`, `test_harness::tests::test_research_is_deterministic_across_identical_runs`
+  - Data-driven unlocks: `research::tests::test_acceptance_unlocks_are_data_driven` (a new technology declared purely as a `TechDef` table entry gates a structure kind, a recipe, a robot chassis and an upgrade token, then grants all four on completion, with no new simulation code path)
+  - Research needs resources AND power AND time (three separate negative tests): `research::tests::test_acceptance_research_cannot_complete_without_resources`, `..._without_power`, `..._without_time`
+  - No new unit class per tier: `research::tests::test_acceptance_upgrades_need_no_new_unit_class_per_tier` (one `StructureKind::Turret` archetype produces four strictly increasing damage/integrity tiers purely through modifiers)
+- Decisions: Decision 27 (Data-Driven Tech Tree and the Network-Distributed Fixed-Point Modifier Store)
+- Remaining debt:
+  - `LogisticsManager` is still single-faction scoped, so the transport-throughput and depot-coverage patches are applied from the lowest registered faction's modifier set. Multi-faction logistics needs a faction field on docks/depots (deferred to the milestone that introduces it).
+  - Modifier kinds for combat (`WeaponDamage`, `WeaponFireRate`, `WeaponAccuracy`), robots (`RobotFabricationSpeed`, `RobotFabricationCost`) and reinforcement (`ReinforcementRate`) are defined, tested and queryable, but the systems that consume them do not exist yet (Milestones 12, 13, 18, 21). Those milestones only need to call `ModifierStore::value_for`.
+  - Modifier patches reach the structure network one tick after the research completes (documented patch-distribution latency), which is deterministic but not instantaneous.
+- Blockers: None
 
-
+### Milestone 25 — Basic Anti-Cheat and EAC Integration Boundary
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/anti-cheat/Cargo.toml, crates/anti-cheat/src/lib.rs, crates/anti-cheat/src/provider.rs, crates/anti-cheat/src/null.rs, crates/anti-cheat/src/basic.rs, crates/anti-cheat/src/detectors.rs, crates/anti-cheat/src/trust.rs, crates/anti-cheat/src/event.rs, crates/anti-cheat/src/manifest.rs, crates/anti-cheat/src/admin.rs, crates/anti-cheat/src/world_view.rs, crates/anti-cheat/src/eos.rs, crates/sim-core/src/command.rs, crates/game-protocol/src/codec.rs, crates/game-protocol/src/server.rs, crates/game-protocol/src/session.rs, crates/game-protocol/src/threaded.rs, crates/game-protocol/src/lib.rs, crates/game-protocol/Cargo.toml, crates/dedicated-server/src/main.rs, crates/dedicated-server/Cargo.toml, Cargo.toml, docs/SECURITY.md, docs/DECISIONS.md, docs/MILESTONE_STATUS.md
+- Validation: cargo fmt --all -- --check, cargo check --workspace, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace all pass; cargo test --workspace --all-features also passes (exercises the feature-gated EOS/EAC adapter); cargo run -p dedicated-server -- --dry-run starts and shuts down cleanly with and without --anti-cheat basic
+- Tests: 211 tests pass across workspace (104 in anti-cheat, 18 in game-client, 18 in game-protocol, 8 in game-types, 63 in sim-core); with --all-features the anti-cheat crate runs 109 (5 additional EOS/EAC adapter tests). Acceptance mapping: `test_m25_acceptance_null_and_basic_providers_produce_identical_sim_state` (disable without changing gameplay), `test_m25_acceptance_server_is_authoritative_with_anti_cheat_disabled` (server authority with anti-cheat off), `test_basic_provider_runs_with_no_proprietary_sdk` + `test_acceptance_basic_provider_inspects_real_sim_state_without_sdk` (basic provider needs no SDK), `test_m25_acceptance_hidden_enemy_detail_is_not_replicated_and_m14_hook_is_pending` (hidden enemy state), `test_m25_acceptance_admin_commands_are_permission_gated_under_null_provider` (admin permissions), `test_m25_official_policy_rejects_mismatched_client_manifest` / `test_m25_private_server_accepts_modded_manifest` (official vs modded policy), `test_m25_codec_roundtrip_for_security_and_admin_commands` (codec 160-164), `test_initialize_fails_with_an_explicit_actionable_error` (no fake SDK calls)
+- Benchmarks: N/A — this milestone makes no scale claims. The null provider is a zero-sized type (`test_null_provider_is_zero_sized_and_allocation_free`) whose `inspect_command` is a constant `Verdict::Allow`, and the basic provider's clean path returns a non-allocating empty `Vec`. Existing sim-bench scenarios are unaffected because anti-cheat sits in the protocol layer, not the simulation.
+- Decisions: Decision 26 (Anti-Cheat Provider Boundary, Internal Heuristic Layer, and EOS/EAC Adapter Seam)
+- Remaining debt:
+  - **Hidden-enemy replication filtering is Milestone 14 debt.** Snapshots still replicate the existence of every entity (id, faction, region, active flag, component mask) to every session. No position, health, inventory or order state crosses the wire, so no actionable hidden state leaks, but per-faction visibility filtering of the entity list itself belongs to M14's sensor/knowledge and replication-interest system. `WorldView::faction_knows_entity` is wired, doc-commented and returns `KnowledgeQuery::Unavailable`; `detect_hidden_target_attempt` is written, tested against a simulated post-M14 world, and reports nothing today. The M14 agent only needs to override that one method.
+  - **Combat detectors are partial (Milestone 13).** `WorldView::weapon_cooldown_ticks` and `WorldView::loaded_ammo` default to `None`; fire-rate falls back to a conservative 4-tick floor and ammo uses the generic `RES_AMMO` container balance rather than magazine state. Invalid *damage claims* cannot be detected because no damage command exists yet.
+  - **No avatar binding (Milestone 12).** `InspectionContext::avatar_entity` is `None`, so actor-scoped detectors fall back to session-scoped tracking.
+  - **No persistent ban list.** Bans are per-match and in-memory; persistence is Milestone 23.
+  - **Transport security is untouched.** No encryption, message authentication, socket-layer rate limiting or DDoS mitigation.
+  - ~~**`Command::Research` has no server-side validation** to guard; the research system is Milestone 19.~~ **Corrected (Phase A, Authority Core):** that variant no longer exists. Milestone 19 retired the `Research { tech_id: ItemId }` placeholder in favour of `QueueResearch` / `CancelResearch` / `ReorderResearchQueue`, all of which are validated authoritatively by `ResearchManager` against the tech tree, the faction's completed set and queue capacity, and are now faction-scoped through `ActorContext` rather than a hardcoded `FactionId::new(1)`.
+- Blockers: None. The EOS/Easy Anti-Cheat SDK is proprietary and is neither licensed nor vendored in this environment, so per the milestone's own condition no FFI crate was created; `crates/anti-cheat/src/eos.rs` provides a compile-safe, feature-gated (`eos-eac`, default off) adapter interface with zero SDK calls that fails with an explicit actionable error rather than pretending to work.

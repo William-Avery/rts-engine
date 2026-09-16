@@ -58,7 +58,7 @@ pub enum BackpressurePolicy {
 }
 
 /// Bounded FIFO queue for regional messages with backpressure management.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundedMessageQueue {
     queue: VecDeque<CrossRegionMessage>,
     max_capacity: usize,
@@ -148,7 +148,7 @@ impl BoundedMessageQueue {
 }
 
 /// Central router for dispatching messages between world regions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrossRegionRouter {
     queues: BTreeMap<RegionId, BoundedMessageQueue>,
     default_capacity: usize,

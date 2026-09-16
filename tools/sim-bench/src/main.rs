@@ -15,7 +15,7 @@ fn print_usage() {
     println!("  --json                Output results in JSON format to stdout");
     println!("  --output <path>       Write JSON report to specified file path");
     println!(
-        "  --scenario <name>     Run specific scenario (10k_walls, 1k_idle_units, hot_vs_cold, scheduled_factories, event_queue_stress, power_grid_1k, production_chain_1k, logistics_jobs_1k)"
+        "  --scenario <name>     Run specific scenario (10k_walls, 1k_idle_units, hot_vs_cold, scheduled_factories, event_queue_stress, power_grid_1k, production_chain_1k, logistics_jobs_1k, robots_1k, research_modifiers_1k)"
     );
     println!("  --help, -h            Show this help message");
 }
@@ -94,10 +94,16 @@ fn main() {
     if run_all || target == "logistics_jobs_1k" {
         results.push(scenarios::scenario_logistics_jobs_1k());
     }
+    if run_all || target == "robots_1k" {
+        results.push(scenarios::scenario_robots_1k());
+    }
+    if run_all || target == "research_modifiers_1k" {
+        results.push(scenarios::scenario_research_modifiers_1k());
+    }
 
     if results.is_empty() {
         eprintln!(
-            "Error: Unknown scenario '{}'. Available: 10k_walls, 1k_idle_units, hot_vs_cold, scheduled_factories, event_queue_stress, power_grid_1k, production_chain_1k, logistics_jobs_1k",
+            "Error: Unknown scenario '{}'. Available: 10k_walls, 1k_idle_units, hot_vs_cold, scheduled_factories, event_queue_stress, power_grid_1k, production_chain_1k, logistics_jobs_1k, robots_1k, research_modifiers_1k",
             target
         );
         std::process::exit(1);

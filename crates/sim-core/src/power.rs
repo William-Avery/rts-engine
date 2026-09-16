@@ -1,4 +1,5 @@
 use crate::event::{EventJournal, SimEvent};
+use crate::modifier::MODIFIER_SCALE;
 use game_types::{FactionId, PowerGridId, SimTick, StructureId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,13 +173,15 @@ pub struct PowerNetworkMetrics {
 }
 
 /// Authoritative power network graph simulator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PowerNetwork {
     nodes: BTreeMap<StructureId, PowerNode>,
     subnets: Vec<PowerSubnet>,
     structure_to_grid: BTreeMap<StructureId, PowerGridId>,
     structure_power_status: BTreeMap<StructureId, PowerStatus>,
     previous_grid_status: BTreeMap<PowerGridId, PowerGridStatus>,
+    /// Research power patches per faction: `(generation_milli, efficiency_milli)`.
+    faction_power_modifiers: BTreeMap<FactionId, (i64, i64)>,
     topology_dirty: bool,
     next_grid_id: u64,
     pub metrics: PowerNetworkMetrics,
@@ -198,10 +201,51 @@ impl PowerNetwork {
             structure_to_grid: BTreeMap::new(),
             structure_power_status: BTreeMap::new(),
             previous_grid_status: BTreeMap::new(),
+            faction_power_modifiers: BTreeMap::new(),
             topology_dirty: false,
             next_grid_id: 1,
             metrics: PowerNetworkMetrics::default(),
         }
+    }
+
+    /// Install a faction's research power patch.
+    ///
+    /// `generation_milli` scales generator output up; `efficiency_milli` scales
+    /// consumer demand down. Both are fixed-point thousandths (`1000` neutral).
+    pub fn set_faction_power_modifiers(
+        &mut self,
+        faction: FactionId,
+        generation_milli: i64,
+        efficiency_milli: i64,
+    ) {
+        self.faction_power_modifiers
+            .insert(faction, (generation_milli.max(0), efficiency_milli.max(1)));
+    }
+
+    /// Current `(generation_milli, efficiency_milli)` patch for a faction.
+    pub fn faction_power_modifiers(&self, faction: FactionId) -> (i64, i64) {
+        self.faction_power_modifiers
+            .get(&faction)
+            .copied()
+            .unwrap_or((MODIFIER_SCALE, MODIFIER_SCALE))
+    }
+
+    /// Generator output after the research generation patch.
+    #[inline]
+    fn patched_generation(base_kw: u32, generation_milli: i64) -> u32 {
+        let scaled = (base_kw as i64).saturating_mul(generation_milli) / MODIFIER_SCALE;
+        scaled.clamp(0, u32::MAX as i64) as u32
+    }
+
+    /// Consumer demand after the research efficiency patch (higher efficiency
+    /// means lower demand). A powered consumer never drops below 1 kW.
+    #[inline]
+    fn patched_demand(base_kw: u32, efficiency_milli: i64) -> u32 {
+        if base_kw == 0 {
+            return 0;
+        }
+        let scaled = (base_kw as i64).saturating_mul(MODIFIER_SCALE) / efficiency_milli.max(1);
+        scaled.clamp(1, u32::MAX as i64) as u32
     }
 
     /// Register or update a structure node in the power network.
@@ -435,13 +479,20 @@ impl PowerNetwork {
             let mut max_charge_kw = 0u32;
             let mut max_discharge_kw = 0u32;
 
+            // Research power patch for the subnet's owning faction.
+            let (generation_milli, efficiency_milli) = self
+                .faction_power_modifiers
+                .get(&subnet.faction_id)
+                .copied()
+                .unwrap_or((MODIFIER_SCALE, MODIFIER_SCALE));
+
             // Step 1: Aggregate baseline generation, demand, and storage capacity
             for &id in &subnet.nodes {
                 if let Some(node) = self.nodes.get(&id)
                     && node.operational
                 {
-                    gen_kw += node.spec.generation_kw;
-                    dem_kw += node.spec.demand_kw;
+                    gen_kw += Self::patched_generation(node.spec.generation_kw, generation_milli);
+                    dem_kw += Self::patched_demand(node.spec.demand_kw, efficiency_milli);
                     capacity_kwh += node.spec.storage_capacity_kwh;
                     stored_kwh += node.stored_energy_kwh;
                     max_charge_kw += node.spec.max_charge_rate_kw;
@@ -585,7 +636,7 @@ impl PowerNetwork {
                     let tier_demand: u32 = node_ids
                         .iter()
                         .filter_map(|id| nodes_map.get(id))
-                        .map(|n| n.spec.demand_kw)
+                        .map(|n| Self::patched_demand(n.spec.demand_kw, efficiency_milli))
                         .sum();
 
                     if tier_demand == 0 {

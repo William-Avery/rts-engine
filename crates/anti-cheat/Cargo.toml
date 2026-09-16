@@ -1,0 +1,19 @@
+[package]
+name = "anti-cheat"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# Enables the EOS / Easy Anti-Cheat adapter boundary (`crate::eos`).
+#
+# The adapter compiles cleanly with this feature on, but contains NO SDK
+# bindings: the Epic Online Services / EAC SDK is proprietary and is neither
+# vendored nor licensed in this repository. With the feature enabled and no SDK
+# present, `EosEacAdapter::initialize` returns an explicit, actionable
+# `AntiCheatError::SdkUnavailable`. See docs/SECURITY.md.
+eos-eac = []
+
+[dependencies]
+game-types = { path = "../game-types" }
+sim-core = { path = "../sim-core" }

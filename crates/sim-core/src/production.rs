@@ -1,5 +1,6 @@
 use crate::event::{EventJournal, ProductionBlockedReason, SimEvent};
 use crate::inventory::{ContainerKind, Inventory};
+use crate::modifier::{ModifierKind, ModifierStore};
 use crate::power::PowerStatus;
 use game_types::{
     DepositId, EntityId, FactionId, GameError, GameResult, RES_AMMO, RES_BASIC_COMPONENTS,
@@ -162,6 +163,77 @@ pub fn all_recipes() -> &'static [Recipe] {
     STATIC_RECIPES
 }
 
+/// Research-derived multipliers applied to an industrial facility for one tick.
+///
+/// Resolved from the faction modifier network by the caller so the production
+/// state machine stays a pure function of its inputs. All values are fixed-point
+/// thousandths; `1000` is neutral.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ProductionModifiers {
+    /// Ore recovered per extraction cycle.
+    pub mining_yield_milli: i64,
+    /// Mining cycle rate (higher shortens the interval between cycles).
+    pub mining_speed_milli: i64,
+    /// Refining and fabrication rate (higher shortens craft duration).
+    pub refining_speed_milli: i64,
+}
+
+impl Default for ProductionModifiers {
+    fn default() -> Self {
+        ProductionModifiers {
+            mining_yield_milli: crate::modifier::MODIFIER_SCALE,
+            mining_speed_milli: crate::modifier::MODIFIER_SCALE,
+            refining_speed_milli: crate::modifier::MODIFIER_SCALE,
+        }
+    }
+}
+
+impl ProductionModifiers {
+    /// Neutral multipliers (no research applied).
+    pub fn neutral() -> Self {
+        ProductionModifiers::default()
+    }
+
+    /// Resolve the multipliers a faction's completed research grants.
+    pub fn from_store(store: &ModifierStore, faction: FactionId) -> Self {
+        ProductionModifiers {
+            mining_yield_milli: store.multiplier_milli(faction, ModifierKind::MiningYield),
+            mining_speed_milli: store.multiplier_milli(faction, ModifierKind::MiningSpeed),
+            refining_speed_milli: store.multiplier_milli(faction, ModifierKind::RefiningSpeed),
+        }
+    }
+
+    /// Scale an integer quantity by a milli multiplier, never below `floor`.
+    fn scale(base: u32, milli: i64, floor: u32) -> u32 {
+        let scaled = (base as i64).saturating_mul(milli) / crate::modifier::MODIFIER_SCALE;
+        scaled.clamp(floor as i64, u32::MAX as i64) as u32
+    }
+
+    /// Divide a duration by a rate multiplier, never below one tick.
+    fn shorten(base: u32, milli: i64) -> u32 {
+        if milli <= 0 {
+            return base.max(1);
+        }
+        let scaled = (base as i64).saturating_mul(crate::modifier::MODIFIER_SCALE) / milli;
+        scaled.clamp(1, u32::MAX as i64) as u32
+    }
+
+    /// Effective ore yield for a cycle after research.
+    pub fn effective_yield(&self, base: u32) -> u32 {
+        Self::scale(base, self.mining_yield_milli, 1)
+    }
+
+    /// Effective ticks between mining cycles after research.
+    pub fn effective_mining_interval(&self, base: u32) -> u32 {
+        Self::shorten(base, self.mining_speed_milli)
+    }
+
+    /// Effective craft duration in ticks after research.
+    pub fn effective_craft_ticks(&self, base: u32) -> u32 {
+        Self::shorten(base, self.refining_speed_milli)
+    }
+}
+
 /// State machine for manufacturing and refining facilities.
 #[derive(Clone, PartialEq, Debug)]
 pub enum ProductionState {
@@ -219,7 +291,7 @@ pub enum MiningDrillState {
 }
 
 /// Authoritative production facility component attached to industrial structures.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProductionFacility {
     pub structure_id: StructureId,
     pub faction_id: FactionId,
@@ -314,15 +386,16 @@ impl ProductionFacility {
         current_tick: SimTick,
         deposits: &mut BTreeMap<DepositId, ResourceDeposit>,
         journal: &mut EventJournal,
+        mods: ProductionModifiers,
     ) -> GameResult<()> {
         let is_powered = power_status.is_operational();
 
         match self.kind {
             FacilityKind::MiningDrill => {
-                self.tick_mining(is_powered, current_tick, deposits, journal)?;
+                self.tick_mining(is_powered, current_tick, deposits, journal, mods)?;
             }
             FacilityKind::Refinery | FacilityKind::Fabricator => {
-                self.tick_production(is_powered, current_tick, journal)?;
+                self.tick_production(is_powered, current_tick, journal, mods)?;
             }
         }
 
@@ -336,6 +409,7 @@ impl ProductionFacility {
         current_tick: SimTick,
         deposits: &mut BTreeMap<DepositId, ResourceDeposit>,
         journal: &mut EventJournal,
+        mods: ProductionModifiers,
     ) -> GameResult<()> {
         if !is_powered {
             if let MiningDrillState::Mining {
@@ -433,7 +507,8 @@ impl ProductionFacility {
         } = self.mining_state
         {
             *progress_ticks += 1;
-            if *progress_ticks >= interval_ticks {
+            let effective_interval = mods.effective_mining_interval(interval_ticks);
+            if *progress_ticks >= effective_interval {
                 let deposit = match deposits.get_mut(&deposit_id) {
                     Some(dep) if !dep.is_depleted() => dep,
                     _ => {
@@ -443,8 +518,9 @@ impl ProductionFacility {
                     }
                 };
 
-                let effective_yield =
+                let purity_yield =
                     ((yield_per_cycle as f32 * deposit.purity).round() as u32).max(1);
+                let effective_yield = mods.effective_yield(purity_yield);
                 let can_store = self
                     .output_inventory
                     .can_accept(deposit.resource_id, effective_yield);
@@ -499,6 +575,7 @@ impl ProductionFacility {
         is_powered: bool,
         current_tick: SimTick,
         journal: &mut EventJournal,
+        mods: ProductionModifiers,
     ) -> GameResult<()> {
         if !is_powered {
             if let ProductionState::Crafting {
@@ -621,14 +698,15 @@ impl ProductionFacility {
                     reservations.push(res_id);
                 }
 
-                let finish_tick = current_tick + recipe.duration_ticks as u64;
+                let craft_ticks = mods.effective_craft_ticks(recipe.duration_ticks);
+                let finish_tick = current_tick + craft_ticks as u64;
                 self.scheduled_completion_tick = Some(finish_tick);
                 self.production_state = ProductionState::Crafting {
                     recipe_id,
                     reservation_ids: reservations,
                     start_tick: current_tick,
                     progress_ticks: 0,
-                    total_ticks: recipe.duration_ticks,
+                    total_ticks: craft_ticks,
                 };
 
                 journal.record(
@@ -720,6 +798,7 @@ impl ProductionFacility {
         current_tick: SimTick,
         deposits: &mut BTreeMap<DepositId, ResourceDeposit>,
         journal: &mut EventJournal,
+        mods: ProductionModifiers,
     ) -> GameResult<()> {
         if delta_ticks == 0 {
             return Ok(());
@@ -728,14 +807,20 @@ impl ProductionFacility {
         // For small steps or active transitions, tick sequentially
         if delta_ticks <= 4 {
             for i in 0..delta_ticks {
-                self.tick(power_status, current_tick + i as u64, deposits, journal)?;
+                self.tick(
+                    power_status,
+                    current_tick + i as u64,
+                    deposits,
+                    journal,
+                    mods,
+                )?;
             }
             return Ok(());
         }
 
         // If unpowered, no progress occurs
         if !power_status.is_operational() {
-            return self.tick(power_status, current_tick, deposits, journal);
+            return self.tick(power_status, current_tick, deposits, journal, mods);
         }
 
         // Advance mining or crafting
@@ -748,15 +833,17 @@ impl ProductionFacility {
                     yield_per_cycle,
                 } = self.mining_state
                 {
+                    let effective_interval = mods.effective_mining_interval(interval_ticks);
                     let total_ticks = progress_ticks + delta_ticks;
-                    let cycles = total_ticks / interval_ticks;
-                    let rem_ticks = total_ticks % interval_ticks;
+                    let cycles = total_ticks / effective_interval;
+                    let rem_ticks = total_ticks % effective_interval;
 
                     if cycles > 0
                         && let Some(deposit) = deposits.get_mut(&deposit_id)
                     {
-                        let effective_yield_per_cycle =
+                        let purity_yield =
                             ((yield_per_cycle as f32 * deposit.purity).round() as u32).max(1);
+                        let effective_yield_per_cycle = mods.effective_yield(purity_yield);
                         let total_wanted = effective_yield_per_cycle * cycles;
 
                         let can_store = self
@@ -797,13 +884,25 @@ impl ProductionFacility {
                 }
                 // Fallback to iterative tick if buffer constraints apply
                 for i in 0..delta_ticks {
-                    self.tick(power_status, current_tick + i as u64, deposits, journal)?;
+                    self.tick(
+                        power_status,
+                        current_tick + i as u64,
+                        deposits,
+                        journal,
+                        mods,
+                    )?;
                 }
             }
             FacilityKind::Refinery | FacilityKind::Fabricator => {
                 // Step iteratively to properly manage state cycles and reservations
                 for i in 0..delta_ticks {
-                    self.tick(power_status, current_tick + i as u64, deposits, journal)?;
+                    self.tick(
+                        power_status,
+                        current_tick + i as u64,
+                        deposits,
+                        journal,
+                        mods,
+                    )?;
                 }
             }
         }

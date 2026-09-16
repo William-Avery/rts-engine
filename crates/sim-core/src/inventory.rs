@@ -1,7 +1,7 @@
 use crate::event::{EventJournal, SimEvent};
 use game_types::{
-    EntityId, GameError, GameResult, ReservationId, ResourceCategory, ResourceId, ResourceRegistry,
-    SimTick,
+    EntityId, FactionId, GameError, GameResult, ReservationId, ResourceCategory, ResourceId,
+    ResourceRegistry, SimTick,
 };
 use std::collections::BTreeMap;
 
@@ -84,6 +84,13 @@ pub struct ActiveReservation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inventory {
     pub owner: EntityId,
+    /// Faction that owns this container.
+    ///
+    /// `FactionId::null()` is unowned world storage, open to every faction.
+    /// Every container the authoritative world creates through
+    /// `WorldState::create_container` is stamped with its entity's faction, so
+    /// the transactional operations below can refuse a foreign actor.
+    pub owner_faction: FactionId,
     pub kind: ContainerKind,
     pub max_slots: usize,
     pub max_volume_liters: u32,
@@ -95,6 +102,7 @@ impl Inventory {
     pub fn new(owner: EntityId, kind: ContainerKind) -> Self {
         Inventory {
             owner,
+            owner_faction: FactionId::null(),
             kind,
             max_slots: kind.default_max_slots(),
             max_volume_liters: kind.default_max_volume_liters(),
@@ -111,12 +119,29 @@ impl Inventory {
     ) -> Self {
         Inventory {
             owner,
+            owner_faction: FactionId::null(),
             kind,
             max_slots,
             max_volume_liters,
             slots: Vec::new(),
             reservations: BTreeMap::new(),
         }
+    }
+
+    /// Bind this container to an owning faction.
+    pub fn with_faction(mut self, faction: FactionId) -> Self {
+        self.owner_faction = faction;
+        self
+    }
+
+    /// Whether `actor_faction` may operate on this container.
+    ///
+    /// A null actor faction is server/internal authority; a null owner faction
+    /// is unowned world storage.
+    pub fn is_accessible_by(&self, actor_faction: FactionId) -> bool {
+        actor_faction.is_null()
+            || self.owner_faction.is_null()
+            || self.owner_faction == actor_faction
     }
 
     /// Calculate total volume occupied in liters.
@@ -515,8 +540,23 @@ impl ReserveRequest {
     }
 }
 
+/// Parameters for one direct atomic transfer between containers.
+///
+/// A struct rather than a positional argument list so the actor faction and the
+/// two endpoints cannot be transposed at a call site.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TransferRequest {
+    /// Faction requesting the move. `FactionId::null()` is server authority.
+    pub actor_faction: FactionId,
+    pub from: EntityId,
+    pub to: EntityId,
+    pub resource_id: ResourceId,
+    pub amount: u32,
+    pub tick: SimTick,
+}
+
 /// Global registry managing container components and atomic multi-inventory transactions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InventoryRegistry {
     inventories: BTreeMap<EntityId, Inventory>,
     next_reservation_id: u64,
@@ -556,6 +596,18 @@ impl InventoryRegistry {
         self.inventories.contains_key(&owner)
     }
 
+    /// Refuse an actor faction that does not own the container behind `owner`.
+    ///
+    /// An entity with no container at all passes: the caller's own lookup
+    /// reports the specific `ContainerNotFound` error instead.
+    pub fn authorize(&self, actor_faction: FactionId, owner: EntityId) -> GameResult<()> {
+        match self.inventories.get(&owner) {
+            None => Ok(()),
+            Some(inv) if inv.is_accessible_by(actor_faction) => Ok(()),
+            Some(_) => Err(GameError::PermissionDenied),
+        }
+    }
+
     /// Generate next unique reservation ID.
     pub fn next_reservation_id(&mut self) -> ReservationId {
         let id = ReservationId::new(self.next_reservation_id);
@@ -566,13 +618,17 @@ impl InventoryRegistry {
     /// Direct atomic transfer between two inventories with zero item duplication or loss.
     pub fn atomic_transfer(
         &mut self,
-        from: EntityId,
-        to: EntityId,
-        resource_id: ResourceId,
-        amount: u32,
-        tick: SimTick,
+        req: TransferRequest,
         journal: &mut EventJournal,
     ) -> GameResult<()> {
+        let TransferRequest {
+            actor_faction,
+            from,
+            to,
+            resource_id,
+            amount,
+            tick,
+        } = req;
         if amount == 0 {
             return Ok(());
         }
@@ -587,6 +643,8 @@ impl InventoryRegistry {
         if !self.inventories.contains_key(&to) {
             return Err(GameError::ContainerNotFound(to));
         }
+        self.authorize(actor_faction, from)?;
+        self.authorize(actor_faction, to)?;
 
         // Check source balance
         let source_avail = self
@@ -651,9 +709,14 @@ impl InventoryRegistry {
     /// Phase 1: Atomically reserve resource in source inventory.
     pub fn two_phase_reserve(
         &mut self,
+        actor_faction: FactionId,
         req: ReserveRequest,
         journal: &mut EventJournal,
     ) -> GameResult<()> {
+        self.authorize(actor_faction, req.from)?;
+        if let Some(target) = req.target_entity {
+            self.authorize(actor_faction, target)?;
+        }
         let inv = self
             .inventories
             .get_mut(&req.from)
@@ -683,6 +746,7 @@ impl InventoryRegistry {
     /// Phase 2 (Commit): Deliver reserved resources from source to destination.
     pub fn two_phase_commit(
         &mut self,
+        actor_faction: FactionId,
         reservation_id: ReservationId,
         from: EntityId,
         to: EntityId,
@@ -696,6 +760,8 @@ impl InventoryRegistry {
         if !self.inventories.contains_key(&to) {
             return Err(GameError::ContainerNotFound(to));
         }
+        self.authorize(actor_faction, from)?;
+        self.authorize(actor_faction, to)?;
 
         // Verify reservation exists in source
         let res = self
@@ -761,11 +827,13 @@ impl InventoryRegistry {
     /// Phase 2 (Abort): Unlock reserved resources back to available balance on source.
     pub fn two_phase_cancel(
         &mut self,
+        actor_faction: FactionId,
         reservation_id: ReservationId,
         from: EntityId,
         tick: SimTick,
         journal: &mut EventJournal,
     ) -> GameResult<()> {
+        self.authorize(actor_faction, from)?;
         let inv = self
             .inventories
             .get_mut(&from)
@@ -851,7 +919,9 @@ mod tests {
         // Phase 1: Reserve 40 Steel
         let mut req1 = ReserveRequest::new(source, res_id, RES_STEEL, 40, SimTick::new(1));
         req1.target_entity = Some(target);
-        registry.two_phase_reserve(req1, &mut journal).unwrap();
+        registry
+            .two_phase_reserve(FactionId::null(), req1, &mut journal)
+            .unwrap();
 
         // Verify balance split: 100 total, 60 available, 40 reserved
         let s = registry.get(source).unwrap();
@@ -861,7 +931,14 @@ mod tests {
 
         // Phase 2 (Commit): Deliver 40 Steel to target
         registry
-            .two_phase_commit(res_id, source, target, SimTick::new(2), &mut journal)
+            .two_phase_commit(
+                FactionId::null(),
+                res_id,
+                source,
+                target,
+                SimTick::new(2),
+                &mut journal,
+            )
             .unwrap();
 
         let s = registry.get(source).unwrap();
@@ -877,6 +954,7 @@ mod tests {
         let res_id_2 = registry.next_reservation_id();
         registry
             .two_phase_reserve(
+                FactionId::null(),
                 ReserveRequest::new(source, res_id_2, RES_STEEL, 25, SimTick::new(3)),
                 &mut journal,
             )
@@ -893,7 +971,13 @@ mod tests {
 
         // Cancel / abort reservation
         registry
-            .two_phase_cancel(res_id_2, source, SimTick::new(4), &mut journal)
+            .two_phase_cancel(
+                FactionId::null(),
+                res_id_2,
+                source,
+                SimTick::new(4),
+                &mut journal,
+            )
             .unwrap();
 
         // Entire 60 is restored to available!
@@ -921,6 +1005,7 @@ mod tests {
         assert!(
             registry
                 .two_phase_reserve(
+                    FactionId::null(),
                     ReserveRequest::new(source, res1, RES_TUNGSTEN_COMPOSITE, 30, SimTick::new(1)),
                     &mut journal
                 )
@@ -929,6 +1014,7 @@ mod tests {
 
         // Worker 2 attempts to reserve 30 items -> fails (only 20 unreserved remain!)
         let err2 = registry.two_phase_reserve(
+            FactionId::null(),
             ReserveRequest::new(source, res2, RES_TUNGSTEN_COMPOSITE, 30, SimTick::new(1)),
             &mut journal,
         );
@@ -944,6 +1030,7 @@ mod tests {
         assert!(
             registry
                 .two_phase_reserve(
+                    FactionId::null(),
                     ReserveRequest::new(source, res3, RES_TUNGSTEN_COMPOSITE, 20, SimTick::new(1)),
                     &mut journal
                 )

@@ -757,7 +757,7 @@ pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
         };
 
         let jid = harness
-            .create_logistics_job(src, dst, res, 25, priority)
+            .create_logistics_job(FactionId::null(), src, dst, res, 25, priority)
             .unwrap();
         job_ids.push(jid);
     }
@@ -765,7 +765,7 @@ pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
     // Initial assignment of the first 250 jobs to haulers
     for (idx, &hauler) in hauler_entities.iter().enumerate() {
         let jid = job_ids[idx];
-        let _ = harness.claim_logistics_job(jid, hauler);
+        let _ = harness.claim_logistics_job(FactionId::null(), jid, hauler);
     }
 
     let start = Instant::now();
@@ -804,5 +804,330 @@ pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
         estimated_memory_bytes: estimate_memory(num_jobs + num_depots + num_haulers, num_regions, 0),
+    }
+}
+
+/// Scenario 9: 1,000 biped robots navigating, separating, escorting, and holding formation.
+pub fn scenario_robots_1k() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_robots = 1_000;
+    let num_regions = 16;
+    let num_players = 8;
+    let num_squads = 40;
+    let ticks_to_run = 60; // 2 seconds of 30 Hz simulation
+    let faction = FactionId::new(1);
+
+    // Setup 16 hot regions in a 4x4 grid
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 250.0,
+            row * 250.0,
+            (col + 1.0) * 250.0,
+            (row + 1.0) * 250.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Hot))
+            .unwrap();
+    }
+
+    // 8 commanders, each raised to the 2-escort progression ceiling.
+    for p in 1..=num_players {
+        let player = game_types::PlayerId::new(p as u32);
+        let reg_id = RegionId::new(((p % num_regions) + 1) as u32);
+        let px = (p as f32) * 60.0;
+        harness
+            .state_mut()
+            .register_player(player, faction, reg_id, (px, 0.0, 30.0))
+            .unwrap();
+        harness
+            .state_mut()
+            .robot_registry
+            .config
+            .grant_escort_cap(player, 2);
+    }
+
+    // 40 squads receiving the bulk of the robots.
+    let squads: Vec<game_types::SquadId> = (0..num_squads)
+        .map(|_| harness.state_mut().create_squad(faction))
+        .collect();
+
+    // 1,000 guardsman/rifleman bipeds distributed across the grid.
+    let mut robots = Vec::with_capacity(num_robots);
+    for i in 0..num_robots {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let chassis = if i % 4 == 0 {
+            sim_core::chassis::RobotChassis::Guardsman
+        } else {
+            sim_core::chassis::RobotChassis::Rifleman
+        };
+        let x = ((i % 50) as f32) * 6.0;
+        let z = ((i / 50) as f32) * 6.0;
+        let robot = harness
+            .state_mut()
+            .spawn_robot(chassis, faction, reg_id, (x, 0.0, z))
+            .unwrap();
+        robots.push(robot);
+    }
+
+    // Assign 16 escorts (2 per commander) and place everything else into squads.
+    let mut next = 0usize;
+    for p in 1..=num_players {
+        let player = game_types::PlayerId::new(p as u32);
+        for _ in 0..2 {
+            let robot = robots[next];
+            next += 1;
+            harness
+                .state_mut()
+                .assign_escort(player, player, robot)
+                .unwrap();
+        }
+    }
+    let commander = game_types::PlayerId::new(1);
+    let squad_members: Vec<game_types::EntityId> = robots[next..].to_vec();
+    {
+        let state = harness.state_mut();
+        for (idx, &robot) in squad_members.iter().enumerate() {
+            let squad = squads[idx % num_squads];
+            let _ = state.robot_registry.assign_squad_member(
+                commander,
+                squad,
+                robot,
+                SimTick::zero(),
+                &mut state.event_journal,
+            );
+        }
+
+        // Every squad reforms on its own rally point, so all members are actively pathing.
+        for (idx, &squad) in squads.iter().enumerate() {
+            let rally = (((idx % 8) as f32) * 80.0, 0.0, ((idx / 8) as f32) * 80.0);
+            let _ = state.robot_registry.regroup_squad(
+                commander,
+                squad,
+                rally,
+                SimTick::zero(),
+                &mut state.event_journal,
+            );
+        }
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+    let elapsed = start.elapsed();
+
+    let metrics = harness.state().scheduler.metrics();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    BenchmarkResult {
+        scenario_name: "robots_1k".to_string(),
+        description:
+            "1,000 biped robots across 16 regions with 8 commanders, 16 escorts, and 40 regrouping squads"
+                .to_string(),
+        entity_count: num_robots,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_robots + num_players, num_regions, 0),
+    }
+}
+
+/// Scenario 10: 1,000 research structures across 64 factions, with the full
+/// tech tree queued and a large faction-wide modifier evaluation sweep.
+pub fn scenario_research_modifiers_1k() -> BenchmarkResult {
+    let mut harness = TestHarness::new();
+    let num_labs = 500;
+    let num_structures = num_labs * 2; // paired lab + generator
+    let num_factions = 64;
+    let num_regions = 16;
+    // 10 seconds of 30 Hz simulation: long enough for tier-1 and tier-2
+    // technologies (90-180 ticks) to actually complete and publish patches.
+    let ticks_to_run = 300;
+    let modifier_eval_passes = 100;
+
+    // Setup 16 regions in a 4x4 grid
+    for r in 1..=num_regions {
+        let reg_id = RegionId::new(r as u32);
+        let col = ((r - 1) % 4) as f32;
+        let row = ((r - 1) / 4) as f32;
+        let bounds = RegionBounds::new(
+            col * 250.0,
+            row * 250.0,
+            (col + 1.0) * 250.0,
+            (row + 1.0) * 250.0,
+        )
+        .unwrap();
+        harness
+            .state_mut()
+            .region_map
+            .add_region(Region::new(reg_id, bounds, RegionState::Hot))
+            .unwrap();
+    }
+
+    // Place 500 powered research laboratories, each paired with its own generator
+    let mut lab_ids = Vec::with_capacity(num_labs);
+    for i in 0..num_labs {
+        let reg_id = RegionId::new(((i % num_regions) + 1) as u32);
+        let faction = FactionId::new(((i % num_factions) + 1) as u32);
+        let lab_pos = ((i % 25) as f32 * 20.0, 0.0, (i / 25) as f32 * 20.0);
+        let gen_pos = (lab_pos.0 + 8.0, 0.0, lab_pos.2);
+
+        for (kind, pos) in [
+            (
+                sim_core::structure::StructureKind::ResearchFacility,
+                lab_pos,
+            ),
+            (sim_core::structure::StructureKind::Generator, gen_pos),
+        ] {
+            let id = harness
+                .state_mut()
+                .structure_registry
+                .request_build(
+                    sim_core::structure::BuildRequest {
+                        player_pos: pos,
+                        requested_pos: pos,
+                        kind,
+                        rotation_deg: 0.0,
+                        faction_id: faction,
+                        region_id: reg_id,
+                        creation_tick: SimTick::zero(),
+                        world_bounds_xz: (-1000.0, 1000.0, -1000.0, 1000.0),
+                    },
+                    None,
+                )
+                .unwrap();
+            harness
+                .state_mut()
+                .structure_registry
+                .complete_construction(id)
+                .unwrap();
+            if kind == sim_core::structure::StructureKind::ResearchFacility {
+                lab_ids.push(id);
+            }
+        }
+    }
+
+    // Discover the laboratories and stock their hoppers with research materials
+    {
+        let state = harness.state_mut();
+        state
+            .research_manager
+            .sync_facilities(&state.structure_registry);
+    }
+    for lab in &lab_ids {
+        if let Some(facility) = harness.state_mut().research_manager.facility_mut(*lab) {
+            let _ = facility.input_inventory.add(game_types::RES_STEEL, 80);
+            let _ = facility
+                .input_inventory
+                .add(game_types::RES_BASIC_COMPONENTS, 30);
+            let _ = facility
+                .input_inventory
+                .add(game_types::RES_ENERGY_CELL, 30);
+        }
+    }
+
+    // Queue the entire available prerequisite frontier for every faction
+    let mut queued_jobs = 0usize;
+    for f in 1..=num_factions {
+        let faction = FactionId::new(f as u32);
+        let available = harness
+            .state()
+            .research_manager
+            .available_techs(faction)
+            .to_vec();
+        for tech in available {
+            let state = harness.state_mut();
+            let tick = state.tick;
+            if state
+                .research_manager
+                .queue_research(faction, tech, tick, &mut state.event_journal)
+                .is_ok()
+            {
+                queued_jobs += 1;
+            }
+        }
+    }
+
+    let start = Instant::now();
+    harness.run_for_ticks(ticks_to_run);
+
+    // Faction-wide modifier evaluation sweep: every kind, every faction, many passes.
+    let mut checksum: i64 = 0;
+    for _ in 0..modifier_eval_passes {
+        for f in 1..=num_factions {
+            let faction = FactionId::new(f as u32);
+            for kind in sim_core::modifier::ALL_MODIFIER_KINDS {
+                checksum = checksum.wrapping_add(
+                    harness
+                        .state()
+                        .structure_registry
+                        .modifiers
+                        .value_for_milli(faction, *kind, 1_000),
+                );
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(checksum);
+
+    let metrics = harness.state().scheduler.metrics();
+    let research_metrics = harness.state().research_manager.metrics.clone();
+    let total_ms = elapsed.as_secs_f64() * 1000.0;
+    let avg_us = if ticks_to_run > 0 {
+        (total_ms * 1000.0) / (ticks_to_run as f64)
+    } else {
+        0.0
+    };
+    let tps = if total_ms > 0.0 {
+        (ticks_to_run as f64) / (total_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let modifier_evals =
+        modifier_eval_passes * num_factions * sim_core::modifier::ALL_MODIFIER_KINDS.len();
+
+    BenchmarkResult {
+        scenario_name: "research_modifiers_1k".to_string(),
+        description: format!(
+            "{num_structures} research structures ({num_labs} labs) across {num_factions} factions and {num_regions} regions; {queued_jobs} queued research jobs, {} started, {} completed, {modifier_evals} modifier evaluations",
+            research_metrics.jobs_started, research_metrics.jobs_completed
+        ),
+        entity_count: num_structures,
+        region_count: num_regions,
+        ticks_run: ticks_to_run,
+        total_duration_ms: total_ms,
+        avg_tick_us: avg_us,
+        ticks_per_sec: tps,
+        jobs_executed_hot: metrics.jobs_executed_hot,
+        jobs_executed_warm: metrics.jobs_executed_warm,
+        jobs_executed_cold: metrics.jobs_executed_cold,
+        entities_ticked_hot: metrics.entities_ticked_hot,
+        entities_ticked_warm: metrics.entities_ticked_warm,
+        entities_ticked_cold: metrics.entities_ticked_cold,
+        messages_routed: metrics.cross_region_messages_processed,
+        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
     }
 }

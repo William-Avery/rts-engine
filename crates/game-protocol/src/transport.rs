@@ -14,6 +14,16 @@ pub trait Transport: Send {
     fn is_connected(&self) -> bool;
     /// Explicitly close the transport.
     fn close(&mut self);
+    /// Source address of the most recently received datagram, when the
+    /// transport has one.
+    ///
+    /// The server binds a session to this address at handshake and refuses
+    /// command packets that arrive from anywhere else. An in-process transport
+    /// has no address and returns `None`, which the server treats as loopback:
+    /// there is no third party on the wire to forge a source.
+    fn last_peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 /// In-memory loopback transport for single-player games and local testing.
@@ -101,6 +111,16 @@ pub trait TransportRecv: Send + 'static {
     fn is_connected(&self) -> bool;
     /// Explicitly close the transport.
     fn close(&mut self);
+    /// Source address of the most recently received datagram, when the
+    /// transport has one.
+    ///
+    /// The server binds a session to this address at handshake and refuses
+    /// command packets that arrive from anywhere else. An in-process transport
+    /// has no address and returns `None`, which the server treats as loopback:
+    /// there is no third party on the wire to forge a source.
+    fn last_peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 /// In-memory loopback sender half.
@@ -212,6 +232,10 @@ pub struct UdpReceiver {
 }
 
 impl TransportRecv for UdpReceiver {
+    fn last_peer_addr(&self) -> Option<SocketAddr> {
+        self.last_peer
+    }
+
     fn recv(&mut self) -> ProtocolResult<Option<Packet>> {
         if !self.connected {
             return Ok(None);
@@ -249,6 +273,7 @@ pub struct UdpTransport {
     remote_addr: Option<SocketAddr>,
     connected: bool,
     buffer: [u8; 65535],
+    last_peer: Option<SocketAddr>,
 }
 
 impl UdpTransport {
@@ -265,6 +290,7 @@ impl UdpTransport {
             remote_addr: None,
             connected: true,
             buffer: [0u8; 65535],
+            last_peer: None,
         })
     }
 
@@ -323,6 +349,10 @@ impl LoopbackTransport {
 }
 
 impl Transport for UdpTransport {
+    fn last_peer_addr(&self) -> Option<SocketAddr> {
+        self.last_peer
+    }
+
     fn send(&mut self, packet: Packet) -> ProtocolResult<()> {
         if !self.connected {
             return Err(ProtocolError::NotConnected);
@@ -346,6 +376,7 @@ impl Transport for UdpTransport {
 
         match self.socket.recv_from(&mut self.buffer) {
             Ok((size, peer)) => {
+                self.last_peer = Some(peer);
                 if self.remote_addr.is_none() {
                     self.remote_addr = Some(peer);
                 }

@@ -75,6 +75,33 @@ pub enum GameError {
     DockQueueFull,
     /// Target location is outside active powered logistics coverage
     OutOfLogisticsCoverage,
+    /// Robot unit not found in the authoritative robot registry
+    RobotNotFound(EntityId),
+    /// Squad not found in the authoritative squad registry
+    SquadNotFound(crate::ids::SquadId),
+    /// Player already holds the maximum number of assigned escorts
+    EscortCapExceeded { assigned: u8, cap: u8 },
+    /// Robot is already assigned as an escort and cannot be reassigned
+    EscortAlreadyAssigned(EntityId),
+    /// Technology identifier is not present in the loaded tech tree
+    TechNotFound(crate::ids::TechId),
+    /// Technology has already been completed by this faction
+    TechAlreadyResearched(crate::ids::TechId),
+    /// Technology is already queued or actively being researched
+    TechAlreadyQueued(crate::ids::TechId),
+    /// A required prerequisite technology has not been completed
+    TechPrerequisiteUnmet {
+        tech: crate::ids::TechId,
+        prerequisite: crate::ids::TechId,
+    },
+    /// Tech tree data failed load-time validation (cycle, dangling prerequisite, duplicate id, ...)
+    TechTreeInvalid(String),
+    /// Research queue for the faction is at maximum capacity
+    ResearchQueueFull { capacity: usize },
+    /// Research job identifier not found in the faction queue
+    ResearchJobNotFound(crate::ids::ResearchJobId),
+    /// Faction owns no constructed research facility able to accept work
+    NoResearchFacility(crate::ids::FactionId),
     /// Authoritative state corruption detected
     CorruptedState(String),
     /// Network protocol error
@@ -157,6 +184,34 @@ impl fmt::Display for GameError {
                     f,
                     "Target location is outside active powered logistics coverage"
                 )
+            }
+            GameError::RobotNotFound(id) => write!(f, "Robot not found: {id}"),
+            GameError::SquadNotFound(id) => write!(f, "Squad not found: {id}"),
+            GameError::EscortCapExceeded { assigned, cap } => write!(
+                f,
+                "Escort capacity exceeded (assigned: {assigned}, cap: {cap})"
+            ),
+            GameError::EscortAlreadyAssigned(id) => {
+                write!(f, "Robot is already assigned as an escort: {id}")
+            }
+            GameError::TechNotFound(id) => write!(f, "Technology not found in tech tree: {id}"),
+            GameError::TechAlreadyResearched(id) => {
+                write!(f, "Technology already researched: {id}")
+            }
+            GameError::TechAlreadyQueued(id) => {
+                write!(f, "Technology already queued for research: {id}")
+            }
+            GameError::TechPrerequisiteUnmet { tech, prerequisite } => write!(
+                f,
+                "Technology {tech} requires prerequisite {prerequisite} to be researched first"
+            ),
+            GameError::TechTreeInvalid(msg) => write!(f, "Invalid tech tree data: {msg}"),
+            GameError::ResearchQueueFull { capacity } => {
+                write!(f, "Research queue is full (capacity: {capacity})")
+            }
+            GameError::ResearchJobNotFound(id) => write!(f, "Research job not found: {id}"),
+            GameError::NoResearchFacility(id) => {
+                write!(f, "Faction {id} owns no constructed research facility")
             }
             GameError::CorruptedState(msg) => write!(f, "Corrupted state detected: {msg}"),
             GameError::ProtocolError(msg) => write!(f, "Protocol error: {msg}"),

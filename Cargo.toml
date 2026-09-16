@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/anti-cheat",
     "crates/game-types",
     "crates/sim-core",
     "crates/game-protocol",

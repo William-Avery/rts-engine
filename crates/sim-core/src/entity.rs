@@ -36,7 +36,7 @@ impl EntityFlags {
 }
 
 /// Simulation entity with metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub id: EntityId,
     pub faction_id: FactionId,
@@ -77,7 +77,7 @@ impl Entity {
 }
 
 /// Entity registry for the simulation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EntityRegistry {
     entities: Vec<Option<Entity>>,
     next_id: u64,

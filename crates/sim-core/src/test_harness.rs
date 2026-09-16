@@ -1,357 +1,35 @@
-use crate::command::{CommandBuffer, CommandEnvelope};
-use crate::entity::EntityRegistry;
-use crate::event::{EventJournal, SimEvent};
-use crate::inventory::{ContainerKind, Inventory, InventoryRegistry};
-use crate::message_queue::CrossRegionRouter;
-use crate::region::{Region, RegionBounds, RegionMap, RegionState};
-use crate::scheduler::MultiRateScheduler;
-use crate::structure::StructureRegistry;
-use game_types::{
-    EntityId, FactionId, GameError, GameResult, RegionId, SimRng, SimTick, StructureId,
-};
+//! Test-only scaffolding around the authoritative [`crate::world::WorldState`].
+//!
+//! The production world state used to live here under the name `TestSimState`;
+//! it is now `sim_core::world::WorldState`. What remains is genuinely about
+//! testing: a harness that owns a world, drives whole ticks through the single
+//! [`crate::dispatch::apply_command`] dispatcher, and can be reset and compared.
 
-/// Simulation state for testing.
-#[derive(Clone)]
-pub struct TestSimState {
-    pub tick: SimTick,
-    pub rng: SimRng,
-    pub entity_registry: EntityRegistry,
-    pub region_map: RegionMap,
-    pub router: CrossRegionRouter,
-    pub scheduler: MultiRateScheduler,
-    pub structure_registry: StructureRegistry,
-    pub inventory_registry: InventoryRegistry,
-    pub command_buffer: CommandBuffer,
-    pub event_journal: EventJournal,
-}
+use crate::command::CommandEnvelope;
+use crate::dispatch::{ActorContext, DEFAULT_PLAYER_REGION, apply_command};
+use crate::logistics::JobPriority;
+use crate::robot::player_for_session;
+use crate::world::WorldState;
+use game_types::{EntityId, FactionId, GameResult, LogisticsJobId, ResourceId, SimTick};
 
-impl Default for TestSimState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TestSimState {
-    /// Create a new test simulation state at tick 0.
-    pub fn new() -> Self {
-        TestSimState {
-            tick: SimTick::zero(),
-            rng: SimRng::with_default_seed(),
-            entity_registry: EntityRegistry::new(),
-            region_map: RegionMap::new(),
-            router: CrossRegionRouter::default(),
-            scheduler: MultiRateScheduler::default(),
-            structure_registry: StructureRegistry::default(),
-            inventory_registry: InventoryRegistry::default(),
-            command_buffer: CommandBuffer::new(),
-            event_journal: EventJournal::new(),
-        }
-    }
-
-    /// Create a new test simulation state with a specific seed.
-    pub fn with_seed(seed: u64) -> Self {
-        TestSimState {
-            tick: SimTick::zero(),
-            rng: SimRng::new(seed),
-            entity_registry: EntityRegistry::new(),
-            region_map: RegionMap::new(),
-            router: CrossRegionRouter::default(),
-            scheduler: MultiRateScheduler::default(),
-            structure_registry: StructureRegistry::default(),
-            inventory_registry: InventoryRegistry::default(),
-            command_buffer: CommandBuffer::new(),
-            event_journal: EventJournal::new(),
-        }
-    }
-
-    /// Advance simulation to a target tick directly without running systems.
-    pub fn advance_to_tick(&mut self, target: SimTick) {
-        self.tick = target;
-    }
-
-    /// Create a test entity in the simulation and assign to a region.
-    pub fn create_entity(&mut self, faction_id: FactionId, region_id: RegionId) -> EntityId {
-        let entity_id = self.entity_registry.create(faction_id, region_id);
-
-        if !region_id.is_null() {
-            // Auto-register region if not yet present in map
-            if self.region_map.get_region(region_id).is_none() {
-                let bounds = RegionBounds::new(0.0, 0.0, 100.0, 100.0).unwrap_or(RegionBounds {
-                    min_x: 0.0,
-                    min_z: 0.0,
-                    max_x: 100.0,
-                    max_z: 100.0,
-                });
-                let _ =
-                    self.region_map
-                        .add_region(Region::new(region_id, bounds, RegionState::Hot));
-            }
-            let _ = self.region_map.assign_entity(entity_id, region_id);
-        }
-
-        self.event_journal.record(
-            self.tick,
-            SimEvent::EntityCreated {
-                entity: entity_id,
-                faction_id,
-                region_id,
-            },
-        );
-        entity_id
-    }
-
-    /// Transfer an entity to a new region atomically without duplication or loss.
-    pub fn transfer_entity(
-        &mut self,
-        entity_id: EntityId,
-        destination_region: RegionId,
-    ) -> GameResult<(RegionId, RegionId)> {
-        let (old_region, new_region) = self
-            .region_map
-            .transfer_entity(entity_id, destination_region)?;
-        self.entity_registry
-            .update_region(entity_id, destination_region)?;
-        self.event_journal.record(
-            self.tick,
-            SimEvent::RegionChanged {
-                entity: entity_id,
-                old_region,
-                new_region,
-            },
-        );
-        Ok((old_region, new_region))
-    }
-
-    /// Add a command to the buffer.
-    pub fn add_command(&mut self, envelope: CommandEnvelope) {
-        self.command_buffer.push(envelope);
-    }
-
-    /// Clear the command buffer (commit boundary).
-    pub fn clear_commands(&mut self) {
-        self.command_buffer.clear();
-    }
-
-    /// Get the current tick.
-    pub fn current_tick(&self) -> SimTick {
-        self.tick
-    }
-
-    /// Get the RNG state0 (for reproducibility checks).
-    pub fn rng_state0(&self) -> u64 {
-        self.rng.state0()
-    }
-
-    /// Get the RNG state1 (for reproducibility checks).
-    pub fn rng_state1(&self) -> u64 {
-        self.rng.state1()
-    }
-
-    /// Register a container for an entity.
-    pub fn create_container(&mut self, entity: EntityId, kind: ContainerKind) {
-        self.inventory_registry
-            .register(Inventory::new(entity, kind));
-    }
-
-    /// Get reference to entity's inventory.
-    pub fn inventory(&self, entity: EntityId) -> Option<&Inventory> {
-        self.inventory_registry.get(entity)
-    }
-
-    /// Get mutable reference to entity's inventory.
-    pub fn inventory_mut(&mut self, entity: EntityId) -> Option<&mut Inventory> {
-        self.inventory_registry.get_mut(entity)
-    }
-
-    /// Atomically transfer resources between two containers with audit logging.
-    pub fn transfer_resources(
-        &mut self,
-        from: EntityId,
-        to: EntityId,
-        resource_id: game_types::ResourceId,
-        amount: u32,
-    ) -> GameResult<()> {
-        self.inventory_registry.atomic_transfer(
-            from,
-            to,
-            resource_id,
-            amount,
-            self.tick,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Atomically reserve an amount of resource under a reservation ID with audit logging.
-    pub fn reserve_resources(
-        &mut self,
-        from: EntityId,
-        reservation_id: game_types::ReservationId,
-        resource_id: game_types::ResourceId,
-        amount: u32,
-        target_entity: Option<EntityId>,
-    ) -> GameResult<()> {
-        let mut req = crate::inventory::ReserveRequest::new(
-            from,
-            reservation_id,
-            resource_id,
-            amount,
-            self.tick,
-        );
-        req.target_entity = target_entity;
-        self.inventory_registry
-            .two_phase_reserve(req, &mut self.event_journal)
-    }
-
-    /// Commit an active reservation and deliver items to destination with audit logging.
-    pub fn commit_resource_transfer(
-        &mut self,
-        reservation_id: game_types::ReservationId,
-        from: EntityId,
-        to: EntityId,
-    ) -> GameResult<()> {
-        self.inventory_registry.two_phase_commit(
-            reservation_id,
-            from,
-            to,
-            self.tick,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Cancel an active reservation and release items back to available balance with audit logging.
-    pub fn cancel_resource_reservation(
-        &mut self,
-        reservation_id: game_types::ReservationId,
-        from: EntityId,
-    ) -> GameResult<()> {
-        self.inventory_registry.two_phase_cancel(
-            reservation_id,
-            from,
-            self.tick,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Authoritatively apply damage to a world structure.
-    pub fn apply_structure_damage(
-        &mut self,
-        id: StructureId,
-        damage: crate::wall::DamageSpec,
-    ) -> GameResult<crate::wall::DamageResult> {
-        self.structure_registry
-            .apply_damage(id, damage, self.tick, &mut self.event_journal)
-    }
-
-    /// Authoritatively repair a world structure using resources from an entity container.
-    pub fn repair_structure(
-        &mut self,
-        id: StructureId,
-        from_inventory: EntityId,
-    ) -> GameResult<crate::wall::RepairResult> {
-        let inv = self
-            .inventory_registry
-            .get_mut(from_inventory)
-            .ok_or(GameError::ContainerNotFound(from_inventory))?;
-        self.structure_registry
-            .request_repair(id, inv, self.tick, &mut self.event_journal)
-    }
-
-    /// Authoritatively checks if a structure is powered.
-    pub fn is_structure_powered(&self, id: StructureId) -> bool {
-        self.structure_registry.is_structure_powered(id)
-    }
-
-    /// Authoritatively checks if a turret structure has power and can acquire/fire at targets.
-    pub fn can_turret_fire(&self, id: StructureId) -> bool {
-        self.structure_registry.can_turret_fire(id)
-    }
-
-    /// Authoritatively checks if an industrial fabricator has power to execute manufacturing jobs.
-    pub fn can_fabricator_run(&self, id: StructureId) -> bool {
-        self.structure_registry.can_fabricator_run(id)
-    }
-
-    /// Create a logistics job in the simulation state.
-    pub fn create_logistics_job(
-        &mut self,
-        source: EntityId,
-        destination: EntityId,
-        resource_id: game_types::ResourceId,
-        amount: u32,
-        priority: crate::logistics::JobPriority,
-    ) -> GameResult<game_types::LogisticsJobId> {
-        self.structure_registry.logistics.create_job(
-            source,
-            destination,
-            resource_id,
-            amount,
-            priority,
-            self.tick,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Atomically claim a logistics job for a worker hauler.
-    pub fn claim_logistics_job(
-        &mut self,
-        job_id: game_types::LogisticsJobId,
-        worker_id: EntityId,
-    ) -> GameResult<()> {
-        self.structure_registry.logistics.claim_job(
-            job_id,
-            worker_id,
-            self.tick,
-            &mut self.inventory_registry,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Execute atomic material pickup for a logistics job.
-    pub fn execute_logistics_pickup(
-        &mut self,
-        job_id: game_types::LogisticsJobId,
-        worker_id: EntityId,
-    ) -> GameResult<()> {
-        self.structure_registry.logistics.execute_pickup(
-            job_id,
-            worker_id,
-            self.tick,
-            &mut self.inventory_registry,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Execute atomic material dropoff for a logistics job.
-    pub fn execute_logistics_dropoff(
-        &mut self,
-        job_id: game_types::LogisticsJobId,
-        worker_id: EntityId,
-    ) -> GameResult<()> {
-        self.structure_registry.logistics.execute_dropoff(
-            job_id,
-            worker_id,
-            self.tick,
-            &mut self.inventory_registry,
-            &mut self.event_journal,
-        )
-    }
-
-    /// Clone the state for deterministic rollback testing.
-    pub fn clone_state(&self) -> Self {
-        self.clone()
-    }
-}
+/// Faction the harness attributes commands to when a session has no lobby entry.
+///
+/// The harness has no session layer, so it derives both the player identity and
+/// the faction from the session id exactly the way the server does, rather than
+/// hardcoding `FactionId::new(1)` at each call site the way the three old
+/// dispatchers did.
+pub const HARNESS_FACTION: FactionId = FactionId::new(1);
 
 /// Test harness for deterministic simulation runs.
 pub struct TestHarness {
-    state: TestSimState,
-    initial_state: TestSimState,
+    state: WorldState,
+    initial_state: WorldState,
 }
 
 impl TestHarness {
     /// Create a new test harness with default seed.
     pub fn new() -> Self {
-        let state = TestSimState::default();
+        let state = WorldState::default();
         TestHarness {
             state: state.clone(),
             initial_state: state,
@@ -360,7 +38,7 @@ impl TestHarness {
 
     /// Create a new test harness with a specific seed.
     pub fn with_seed(seed: u64) -> Self {
-        let state = TestSimState::with_seed(seed);
+        let state = WorldState::with_seed(seed);
         TestHarness {
             state: state.clone(),
             initial_state: state,
@@ -373,165 +51,33 @@ impl TestHarness {
         self.run_until(target_tick);
     }
 
+    /// Resolve the actor identity of a session the same way the server does.
+    fn actor_for(&mut self, envelope: &CommandEnvelope) -> ActorContext {
+        let player = player_for_session(envelope.session_id);
+        ActorContext::new(envelope.session_id, player, HARNESS_FACTION)
+            .resolve_avatar(&mut self.state, DEFAULT_PLAYER_REGION)
+    }
+
     /// Execute a single simulation tick.
     pub fn step_tick(&mut self) {
         self.state.tick = self.state.tick.next();
 
-        // Drain and apply queued commands
-        while let Some(envelope) = self.state.command_buffer.pop() {
-            match envelope.command {
-                crate::command::Command::TransferRegion {
-                    entity_id,
-                    destination_region,
-                } => {
-                    let _ = self.state.transfer_entity(entity_id, destination_region);
-                }
-                crate::command::Command::BuildStructure {
-                    kind,
-                    position,
-                    rotation_deg,
-                } => {
-                    let _ = self.state.structure_registry.request_build(
-                        crate::structure::BuildRequest {
-                            player_pos: position,
-                            requested_pos: position,
-                            kind,
-                            rotation_deg,
-                            faction_id: FactionId::new(1),
-                            region_id: RegionId::new(1),
-                            creation_tick: self.state.tick,
-                            world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
-                        },
-                        None,
-                    );
-                }
-                crate::command::Command::DismantleStructure { structure_id } => {
-                    let _ = self
-                        .state
-                        .structure_registry
-                        .request_dismantle(structure_id, FactionId::new(1));
-                }
-                crate::command::Command::RepairStructure {
-                    structure_id,
-                    actor_entity: Some(actor),
-                } => {
-                    let _ = self.state.repair_structure(structure_id, actor);
-                }
-                crate::command::Command::TransferResource {
-                    from_entity,
-                    to_entity,
-                    resource_id,
-                    amount,
-                } => {
-                    let _ =
-                        self.state
-                            .transfer_resources(from_entity, to_entity, resource_id, amount);
-                }
-                crate::command::Command::ReserveResource {
-                    entity,
-                    resource_id,
-                    amount,
-                    reservation_id,
-                } => {
-                    let _ = self.state.reserve_resources(
-                        entity,
-                        reservation_id,
-                        resource_id,
-                        amount,
-                        None,
-                    );
-                }
-                crate::command::Command::CommitTransfer {
-                    reservation_id,
-                    from_entity,
-                    to_entity,
-                } => {
-                    let _ =
-                        self.state
-                            .commit_resource_transfer(reservation_id, from_entity, to_entity);
-                }
-                crate::command::Command::CancelReservation {
-                    reservation_id,
-                    from_entity,
-                } => {
-                    let _ = self
-                        .state
-                        .cancel_resource_reservation(reservation_id, from_entity);
-                }
-                crate::command::Command::CreateLogisticsJob {
-                    source,
-                    destination,
-                    resource_id,
-                    amount,
-                    priority,
-                } => {
-                    let _ = self.state.structure_registry.logistics.create_job(
-                        source,
-                        destination,
-                        resource_id,
-                        amount,
-                        crate::logistics::JobPriority::from_u8(priority),
-                        self.state.tick,
-                        &mut self.state.event_journal,
-                    );
-                }
-                crate::command::Command::CancelLogisticsJob { job_id } => {
-                    let _ = self.state.structure_registry.logistics.cancel_job(
-                        job_id,
-                        "Command cancelled",
-                        self.state.tick,
-                        &mut self.state.inventory_registry,
-                        &mut self.state.event_journal,
-                    );
-                }
-                crate::command::Command::ClaimLogisticsJob { job_id, worker_id } => {
-                    let _ = self.state.structure_registry.logistics.claim_job(
-                        job_id,
-                        worker_id,
-                        self.state.tick,
-                        &mut self.state.inventory_registry,
-                        &mut self.state.event_journal,
-                    );
-                }
-                crate::command::Command::ExecuteLogisticsPickup { job_id, worker_id } => {
-                    let _ = self.state.structure_registry.logistics.execute_pickup(
-                        job_id,
-                        worker_id,
-                        self.state.tick,
-                        &mut self.state.inventory_registry,
-                        &mut self.state.event_journal,
-                    );
-                }
-                crate::command::Command::ExecuteLogisticsDropoff { job_id, worker_id } => {
-                    let _ = self.state.structure_registry.logistics.execute_dropoff(
-                        job_id,
-                        worker_id,
-                        self.state.tick,
-                        &mut self.state.inventory_registry,
-                        &mut self.state.event_journal,
-                    );
-                }
-                _ => {}
-            }
+        // Drain and apply queued commands through the one dispatcher the
+        // servers use, in deterministic `(session_id, sequence)` order.
+        for envelope in self
+            .state
+            .command_buffer
+            .drain_ordered()
+            .collect::<Vec<_>>()
+        {
+            let actor = self.actor_for(&envelope);
+            let _ = apply_command(&mut self.state, &actor, &envelope.command);
         }
+        // The harness has no session layer, so authorized session directives
+        // are simply observed and dropped.
+        self.state.pending_session_directives.clear();
 
-        self.state
-            .structure_registry
-            .tick_with_journal(self.state.tick, &mut self.state.event_journal);
-
-        // Step authoritative logistics operations
-        self.state.structure_registry.logistics.step(
-            self.state.tick,
-            &mut self.state.inventory_registry,
-            &mut self.state.event_journal,
-        );
-
-        // Run multi-rate scheduler across regions
-        self.state.scheduler.tick(
-            self.state.tick,
-            &mut self.state.region_map,
-            &mut self.state.router,
-        );
+        self.state.step_systems();
     }
 
     /// Run the simulation until a target tick.
@@ -542,12 +88,12 @@ impl TestHarness {
     }
 
     /// Get the current simulation state.
-    pub fn state(&self) -> &TestSimState {
+    pub fn state(&self) -> &WorldState {
         &self.state
     }
 
     /// Get mutable access to the simulation state.
-    pub fn state_mut(&mut self) -> &mut TestSimState {
+    pub fn state_mut(&mut self) -> &mut WorldState {
         &mut self.state
     }
 
@@ -557,7 +103,11 @@ impl TestHarness {
     }
 
     /// Create an entity for testing.
-    pub fn create_entity(&mut self, faction_id: FactionId, region_id: RegionId) -> EntityId {
+    pub fn create_entity(
+        &mut self,
+        faction_id: FactionId,
+        region_id: game_types::RegionId,
+    ) -> EntityId {
         self.state.create_entity(faction_id, region_id)
     }
 
@@ -569,44 +119,59 @@ impl TestHarness {
     /// Create a logistics job in the simulation state.
     pub fn create_logistics_job(
         &mut self,
+        actor_faction: FactionId,
         source: EntityId,
         destination: EntityId,
-        resource_id: game_types::ResourceId,
+        resource_id: ResourceId,
         amount: u32,
-        priority: crate::logistics::JobPriority,
-    ) -> GameResult<game_types::LogisticsJobId> {
-        self.state
-            .create_logistics_job(source, destination, resource_id, amount, priority)
+        priority: JobPriority,
+    ) -> GameResult<LogisticsJobId> {
+        self.state.create_logistics_job(
+            actor_faction,
+            source,
+            destination,
+            resource_id,
+            amount,
+            priority,
+        )
     }
 
     /// Atomically claim a logistics job for a worker hauler.
     pub fn claim_logistics_job(
         &mut self,
-        job_id: game_types::LogisticsJobId,
+        actor_faction: FactionId,
+        job_id: LogisticsJobId,
         worker_id: EntityId,
     ) -> GameResult<()> {
-        self.state.claim_logistics_job(job_id, worker_id)
+        self.state
+            .claim_logistics_job(actor_faction, job_id, worker_id)
     }
 
     /// Execute atomic material pickup for a logistics job.
     pub fn execute_logistics_pickup(
         &mut self,
-        job_id: game_types::LogisticsJobId,
+        actor_faction: FactionId,
+        job_id: LogisticsJobId,
         worker_id: EntityId,
     ) -> GameResult<()> {
-        self.state.execute_logistics_pickup(job_id, worker_id)
+        self.state
+            .execute_logistics_pickup(actor_faction, job_id, worker_id)
     }
 
     /// Execute atomic material dropoff for a logistics job.
     pub fn execute_logistics_dropoff(
         &mut self,
-        job_id: game_types::LogisticsJobId,
+        actor_faction: FactionId,
+        job_id: LogisticsJobId,
         worker_id: EntityId,
     ) -> GameResult<()> {
-        self.state.execute_logistics_dropoff(job_id, worker_id)
+        self.state
+            .execute_logistics_dropoff(actor_faction, job_id, worker_id)
     }
 
     /// Assert that two harnesses with the same seed produce identical state.
+    ///
+    /// Compares the whole [`WorldState`], not a handful of counters.
     pub fn assert_reproducibility(harness1: &mut TestHarness, harness2: &mut TestHarness) {
         assert_eq!(
             harness1.state.tick, harness2.state.tick,
@@ -622,25 +187,9 @@ impl TestHarness {
             harness2.state.rng_state1(),
             "RNG state1 should be equal"
         );
-        assert_eq!(
-            harness1.state.entity_registry.count(),
-            harness2.state.entity_registry.count(),
-            "Entity registry count should be equal"
-        );
-        assert_eq!(
-            harness1.state.region_map.total_entities(),
-            harness2.state.region_map.total_entities(),
-            "Region map entity counts should be equal"
-        );
-        assert_eq!(
-            harness1.state.scheduler.metrics().total_jobs_executed(),
-            harness2.state.scheduler.metrics().total_jobs_executed(),
-            "Total jobs executed should be equal"
-        );
-        assert_eq!(
-            harness1.state.scheduler.metrics().total_entities_ticked(),
-            harness2.state.scheduler.metrics().total_entities_ticked(),
-            "Total entities ticked should be equal"
+        assert!(
+            harness1.state == harness2.state,
+            "Whole authoritative world state should be identical"
         );
     }
 
@@ -659,10 +208,12 @@ impl Default for TestHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message_queue::{BackpressurePolicy, CrossRegionPayload};
-    use crate::region::RegionGrid;
+    use crate::event::{EventJournal, SimEvent};
+    use crate::inventory::{ContainerKind, Inventory};
+    use crate::message_queue::{BackpressurePolicy, CrossRegionPayload, CrossRegionRouter};
+    use crate::region::{Region, RegionBounds, RegionGrid, RegionState};
     use crate::scheduler::WakeupReason;
-    use game_types::GameError;
+    use game_types::{GameError, RegionId, StructureId, TechId};
 
     #[test]
     fn test_basic_simulation() {
@@ -805,7 +356,9 @@ mod tests {
 
         // Transfer all 10 entities to region 2
         for &e in &entities {
-            let res = harness.state_mut().transfer_entity(e, reg2);
+            let res = harness
+                .state_mut()
+                .transfer_entity(FactionId::null(), e, reg2);
             assert!(res.is_ok());
             assert_eq!(res.unwrap(), (reg1, reg2));
         }
@@ -842,7 +395,9 @@ mod tests {
 
         // Transfer 4 entities back to region 1
         for &e in &entities[0..4] {
-            let res = harness.state_mut().transfer_entity(e, reg1);
+            let res = harness
+                .state_mut()
+                .transfer_entity(FactionId::null(), e, reg1);
             assert!(res.is_ok());
         }
 
@@ -867,15 +422,18 @@ mod tests {
         assert_eq!(harness.state().region_map.total_entities(), 10);
 
         // Error cases: non-existent entity
-        let err_entity = harness
-            .state_mut()
-            .transfer_entity(EntityId::new(9999), reg1);
+        let err_entity =
+            harness
+                .state_mut()
+                .transfer_entity(FactionId::null(), EntityId::new(9999), reg1);
         assert!(matches!(err_entity, Err(GameError::EntityNotFound(_))));
 
         // Error cases: non-existent region
-        let err_reg = harness
-            .state_mut()
-            .transfer_entity(entities[0], RegionId::new(9999));
+        let err_reg = harness.state_mut().transfer_entity(
+            FactionId::null(),
+            entities[0],
+            RegionId::new(9999),
+        );
         assert!(matches!(err_reg, Err(GameError::RegionNotFound(_))));
 
         // Invariant holds: total count unaffected by failed transfers
@@ -1210,10 +768,13 @@ mod tests {
             .unwrap();
 
         // 1. Attempt transfer of 150 Steel (exceeds balance of 100)
-        let err1 =
-            harness
-                .state_mut()
-                .transfer_resources(src_ent, dst_ent, game_types::RES_STEEL, 150);
+        let err1 = harness.state_mut().transfer_resources(
+            FactionId::null(),
+            src_ent,
+            dst_ent,
+            game_types::RES_STEEL,
+            150,
+        );
         assert!(matches!(
             err1,
             Err(game_types::GameError::InsufficientUnreservedBalance { .. })
@@ -1257,10 +818,13 @@ mod tests {
         );
 
         // Attempt transfer of 180 Steel (180 * 3L = 540L > 500L max volume of Backpack)
-        let err2 =
-            harness
-                .state_mut()
-                .transfer_resources(src_ent, dst_ent, game_types::RES_STEEL, 180);
+        let err2 = harness.state_mut().transfer_resources(
+            FactionId::null(),
+            src_ent,
+            dst_ent,
+            game_types::RES_STEEL,
+            180,
+        );
         assert!(matches!(
             err2,
             Err(game_types::GameError::InventoryFull { .. })
@@ -1311,30 +875,44 @@ mod tests {
         // 1. Reserve 50 Iron Ore
         harness
             .state_mut()
-            .reserve_resources(src, res_id, game_types::RES_IRON_ORE, 50, Some(dst))
+            .reserve_resources(
+                FactionId::null(),
+                src,
+                res_id,
+                game_types::RES_IRON_ORE,
+                50,
+                Some(dst),
+            )
             .unwrap();
 
         // 2. Commit transfer
         harness
             .state_mut()
-            .commit_resource_transfer(res_id, src, dst)
+            .commit_resource_transfer(FactionId::null(), res_id, src, dst)
             .unwrap();
 
         // 3. Direct transfer of 30 Iron Ore
         harness
             .state_mut()
-            .transfer_resources(src, dst, game_types::RES_IRON_ORE, 30)
+            .transfer_resources(FactionId::null(), src, dst, game_types::RES_IRON_ORE, 30)
             .unwrap();
 
         // 4. Reserve and Cancel
         let res_id_2 = harness.state_mut().inventory_registry.next_reservation_id();
         harness
             .state_mut()
-            .reserve_resources(src, res_id_2, game_types::RES_IRON_ORE, 20, None)
+            .reserve_resources(
+                FactionId::null(),
+                src,
+                res_id_2,
+                game_types::RES_IRON_ORE,
+                20,
+                None,
+            )
             .unwrap();
         harness
             .state_mut()
-            .cancel_resource_reservation(res_id_2, src)
+            .cancel_resource_reservation(FactionId::null(), res_id_2, src)
             .unwrap();
 
         // Audit check in event journal
@@ -2180,7 +1758,7 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_extraction_target(drill_id, game_types::DepositId::new(1))
+            .set_extraction_target(FactionId::null(), drill_id, game_types::DepositId::new(1))
             .unwrap();
 
         // Step 15 ticks for one complete mining cycle
@@ -2294,7 +1872,11 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_production_recipe(ref_id, crate::production::RECIPE_SMELT_STEEL)
+            .set_production_recipe(
+                FactionId::null(),
+                ref_id,
+                crate::production::RECIPE_SMELT_STEEL,
+            )
             .unwrap();
 
         // Add 10 Iron Ore into refinery input hopper
@@ -2413,7 +1995,11 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_production_recipe(ref_tungsten, crate::production::RECIPE_SMELT_TUNGSTEN)
+            .set_production_recipe(
+                FactionId::null(),
+                ref_tungsten,
+                crate::production::RECIPE_SMELT_TUNGSTEN,
+            )
             .unwrap();
         harness
             .state_mut()
@@ -2445,7 +2031,11 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_production_recipe(ref_tungsten, crate::production::RECIPE_SINTER_CERAMIC)
+            .set_production_recipe(
+                FactionId::null(),
+                ref_tungsten,
+                crate::production::RECIPE_SINTER_CERAMIC,
+            )
             .unwrap();
         harness
             .state_mut()
@@ -2476,7 +2066,11 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_production_recipe(ref_tungsten, crate::production::RECIPE_HARDEN_STEEL)
+            .set_production_recipe(
+                FactionId::null(),
+                ref_tungsten,
+                crate::production::RECIPE_HARDEN_STEEL,
+            )
             .unwrap();
         harness
             .state_mut()
@@ -2531,6 +2125,7 @@ mod tests {
             .state_mut()
             .structure_registry
             .set_production_recipe(
+                FactionId::null(),
                 fab_id,
                 crate::production::RECIPE_SYNTHESIZE_TUNGSTEN_COMPOSITE,
             )
@@ -2626,7 +2221,11 @@ mod tests {
         harness
             .state_mut()
             .structure_registry
-            .set_production_recipe(ref_id, crate::production::RECIPE_SMELT_STEEL)
+            .set_production_recipe(
+                FactionId::null(),
+                ref_id,
+                crate::production::RECIPE_SMELT_STEEL,
+            )
             .unwrap();
 
         harness
@@ -2752,6 +2351,7 @@ mod tests {
                 SimTick::zero(),
                 &mut deposits,
                 &mut journal,
+                crate::production::ProductionModifiers::neutral(),
             )
             .unwrap();
 
@@ -2820,6 +2420,7 @@ mod tests {
         // Create single-worker logistics job
         let job_id = harness
             .create_logistics_job(
+                FactionId::null(),
                 src_ent,
                 dst_ent,
                 game_types::RES_IRON_ORE,
@@ -2829,7 +2430,7 @@ mod tests {
             .unwrap();
 
         // Hauler 1 claims successfully
-        let res1 = harness.claim_logistics_job(job_id, h1);
+        let res1 = harness.claim_logistics_job(FactionId::null(), job_id, h1);
         assert!(
             res1.is_ok(),
             "Hauler 1 claims single worker job: {:?}",
@@ -2837,12 +2438,12 @@ mod tests {
         );
 
         // Haulers 2 and 3 race to claim the same job -> rejected with JobAlreadyClaimed
-        let res2 = harness.claim_logistics_job(job_id, h2);
+        let res2 = harness.claim_logistics_job(FactionId::null(), job_id, h2);
         assert!(matches!(
             res2,
             Err(game_types::GameError::JobAlreadyClaimed(_))
         ));
-        let res3 = harness.claim_logistics_job(job_id, h3);
+        let res3 = harness.claim_logistics_job(FactionId::null(), job_id, h3);
         assert!(matches!(
             res3,
             Err(game_types::GameError::JobAlreadyClaimed(_))
@@ -2911,6 +2512,7 @@ mod tests {
         // Create job
         let job_id = harness
             .create_logistics_job(
+                FactionId::null(),
                 src_ent,
                 dst_ent,
                 game_types::RES_STEEL,
@@ -3209,6 +2811,7 @@ mod tests {
 
         let job_id = harness
             .create_logistics_job(
+                FactionId::null(),
                 src_ent,
                 dst_ent,
                 game_types::RES_STEEL,
@@ -3283,6 +2886,7 @@ mod tests {
 
         let job_id = harness
             .create_logistics_job(
+                FactionId::null(),
                 src_ent,
                 dst_ent,
                 game_types::RES_IRON_ORE,
@@ -3320,5 +2924,599 @@ mod tests {
                 .jobs_starved_count,
             1
         );
+    }
+
+    /// ACCEPTANCE: robot simulation runs headless inside the standard tick loop.
+    #[test]
+    fn test_headless_harness_ticks_escorted_guardsman_through_commands() {
+        let mut harness = TestHarness::new();
+        let faction = FactionId::new(1);
+        let region = RegionId::new(1);
+        let session = game_types::SessionId::new(3);
+        let player = crate::robot::player_for_session(session);
+
+        harness
+            .state_mut()
+            .register_player(player, faction, region, (0.0, 0.0, 0.0))
+            .unwrap();
+        let guardsman = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                faction,
+                region,
+                (-10.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        // Escort assignment arrives as a normal command envelope on the session.
+        harness.add_command(CommandEnvelope::new(
+            session,
+            1,
+            SimTick::zero(),
+            crate::command::Command::AssignEscort {
+                player,
+                robot_id: guardsman,
+            },
+        ));
+        harness.run_for_ticks(1);
+        assert_eq!(
+            harness.state().robot_registry.escorts_for(player),
+            &[guardsman]
+        );
+
+        // The player walks away; the guardsman closes to its standoff distance.
+        for step in 1..=300u64 {
+            harness.add_command(CommandEnvelope::new(
+                session,
+                step + 1,
+                harness.current_tick(),
+                crate::command::Command::Move {
+                    position: (0.2 * step as f32, 0.0, 0.0),
+                    velocity: (6.0, 0.0, 0.0),
+                },
+            ));
+            harness.run_for_ticks(1);
+        }
+
+        let distance = harness
+            .state()
+            .robot_registry
+            .distance_to_target(guardsman)
+            .unwrap();
+        let standoff = crate::chassis::RobotChassis::Guardsman
+            .archetype()
+            .follow_standoff;
+        assert!(
+            distance <= standoff + 2.0 && distance >= 1.5,
+            "guardsman failed to hold station headlessly: {distance}"
+        );
+    }
+
+    #[test]
+    fn test_harness_rejects_robot_commands_from_a_foreign_session() {
+        let mut harness = TestHarness::new();
+        let faction = FactionId::new(1);
+        let region = RegionId::new(1);
+        let owner_session = game_types::SessionId::new(1);
+        let attacker_session = game_types::SessionId::new(2);
+        let owner = crate::robot::player_for_session(owner_session);
+        let attacker = crate::robot::player_for_session(attacker_session);
+
+        harness
+            .state_mut()
+            .register_player(owner, faction, region, (0.0, 0.0, 0.0))
+            .unwrap();
+        harness
+            .state_mut()
+            .register_player(attacker, faction, region, (20.0, 0.0, 0.0))
+            .unwrap();
+        let robot = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                faction,
+                region,
+                (2.0, 0.0, 0.0),
+            )
+            .unwrap();
+        harness
+            .state_mut()
+            .assign_escort(owner, owner, robot)
+            .unwrap();
+
+        // The attacker's session issues orders for someone else's escort.
+        harness.add_command(CommandEnvelope::new(
+            attacker_session,
+            1,
+            SimTick::zero(),
+            crate::command::Command::RobotCommand {
+                robot_id: robot,
+                command_type: crate::command::RobotCommandType::Move {
+                    position: (900.0, 0.0, 900.0),
+                },
+            },
+        ));
+        harness.add_command(CommandEnvelope::new(
+            attacker_session,
+            2,
+            SimTick::zero(),
+            crate::command::Command::ReleaseEscort {
+                player: owner,
+                robot_id: robot,
+            },
+        ));
+        harness.run_for_ticks(2);
+
+        let state = harness.state();
+        assert_eq!(state.robot_registry.get(robot).unwrap().owner, Some(owner));
+        assert!(matches!(
+            state.robot_registry.get(robot).unwrap().order,
+            crate::robot::RobotOrder::Follow { .. }
+        ));
+        assert_eq!(state.robot_registry.escorts_for(owner), &[robot]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Milestone 19 — research, unlocks, and network-distributed modifiers
+    // ---------------------------------------------------------------------
+
+    /// Build a structure and finish its construction immediately.
+    fn m19_build(
+        harness: &mut TestHarness,
+        kind: crate::structure::StructureKind,
+        pos: (f32, f32, f32),
+    ) -> StructureId {
+        let id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(
+                crate::structure::BuildRequest {
+                    player_pos: pos,
+                    requested_pos: pos,
+                    kind,
+                    rotation_deg: 0.0,
+                    faction_id: FactionId::new(1),
+                    region_id: RegionId::new(1),
+                    creation_tick: SimTick::zero(),
+                    world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+                },
+                None,
+            )
+            .unwrap();
+        harness
+            .state_mut()
+            .structure_registry
+            .complete_construction(id)
+            .unwrap();
+        id
+    }
+
+    /// Grant a technology (and its prerequisites) directly, bypassing the queue.
+    fn m19_grant(harness: &mut TestHarness, techs: &[TechId]) {
+        let tick = harness.state().tick;
+        for tech in techs {
+            let mut journal = EventJournal::new();
+            harness
+                .state_mut()
+                .research_manager
+                .grant_tech(FactionId::new(1), *tech, tick, &mut journal)
+                .unwrap();
+        }
+        // Publish the resulting patch into the structure network immediately.
+        let patch = harness.state().research_manager.modifiers.clone();
+        harness
+            .state_mut()
+            .structure_registry
+            .install_modifier_patch(&patch);
+    }
+
+    /// End-to-end research through the authoritative command pipeline.
+    #[test]
+    fn test_stepped_research_command_pipeline_completes_tech() {
+        let mut harness = TestHarness::new();
+        m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Generator,
+            (0.0, 0.0, 0.0),
+        );
+        let lab = m19_build(
+            &mut harness,
+            crate::structure::StructureKind::ResearchFacility,
+            (8.0, 0.0, 0.0),
+        );
+
+        // One tick to let the registry discover and power the facility.
+        harness.step_tick();
+        harness
+            .state_mut()
+            .research_manager
+            .facility_mut(lab)
+            .unwrap()
+            .input_inventory
+            .add(game_types::RES_STEEL, 20)
+            .unwrap();
+
+        // Client sends intent; the server validates and decides.
+        harness.add_command(CommandEnvelope::new(
+            game_types::SessionId::new(1),
+            1,
+            harness.current_tick(),
+            crate::command::Command::QueueResearch {
+                tech_id: crate::research::TECH_BASIC_METALLURGY,
+            },
+        ));
+
+        harness.run_for_ticks(120);
+
+        assert!(
+            harness
+                .state()
+                .research_manager
+                .is_completed(FactionId::new(1), crate::research::TECH_BASIC_METALLURGY)
+        );
+        // The completed patch was distributed into the structure network replica.
+        assert_eq!(
+            harness
+                .state()
+                .structure_registry
+                .modifiers
+                .multiplier_milli(
+                    FactionId::new(1),
+                    crate::modifier::ModifierKind::RefiningSpeed
+                ),
+            1100
+        );
+    }
+
+    /// Research cancellation through the command pipeline refunds inputs in full.
+    #[test]
+    fn test_stepped_research_cancel_command_refunds_inputs() {
+        let mut harness = TestHarness::new();
+        m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Generator,
+            (0.0, 0.0, 0.0),
+        );
+        let lab = m19_build(
+            &mut harness,
+            crate::structure::StructureKind::ResearchFacility,
+            (8.0, 0.0, 0.0),
+        );
+        harness.step_tick();
+        harness
+            .state_mut()
+            .research_manager
+            .facility_mut(lab)
+            .unwrap()
+            .input_inventory
+            .add(game_types::RES_STEEL, 20)
+            .unwrap();
+
+        let job = harness
+            .state_mut()
+            .queue_research(FactionId::new(1), crate::research::TECH_BASIC_METALLURGY)
+            .unwrap();
+        harness.run_for_ticks(20);
+        assert_eq!(
+            harness
+                .state()
+                .research_manager
+                .facility(lab)
+                .unwrap()
+                .input_inventory
+                .available_quantity(game_types::RES_STEEL),
+            0
+        );
+
+        harness.add_command(CommandEnvelope::new(
+            game_types::SessionId::new(1),
+            2,
+            harness.current_tick(),
+            crate::command::Command::CancelResearch { job_id: job },
+        ));
+        harness.step_tick();
+
+        assert!(
+            harness
+                .state()
+                .research_manager
+                .queue(FactionId::new(1))
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .state()
+                .research_manager
+                .facility(lab)
+                .unwrap()
+                .input_inventory
+                .available_quantity(game_types::RES_STEEL),
+            20
+        );
+    }
+
+    /// Mining yield research measurably increases ore extracted by the SAME drill
+    /// archetype - no new drill class is introduced.
+    #[test]
+    fn test_research_modifier_boosts_mining_end_to_end() {
+        fn ore_after(ticks: u64, with_research: bool) -> u32 {
+            let mut harness = TestHarness::new();
+            m19_build(
+                &mut harness,
+                crate::structure::StructureKind::Generator,
+                (0.0, 0.0, 0.0),
+            );
+            let drill = m19_build(
+                &mut harness,
+                crate::structure::StructureKind::MiningDrill,
+                (8.0, 0.0, 0.0),
+            );
+            harness.state_mut().structure_registry.register_deposit(
+                crate::production::ResourceDeposit::new(
+                    game_types::DepositId::new(1),
+                    game_types::RES_IRON_ORE,
+                    (8.0, 0.0, 0.0),
+                    100_000,
+                    1.0,
+                ),
+            );
+            harness
+                .state_mut()
+                .structure_registry
+                .set_extraction_target(FactionId::null(), drill, game_types::DepositId::new(1))
+                .unwrap();
+
+            if with_research {
+                m19_grant(
+                    &mut harness,
+                    &[
+                        crate::research::TECH_BASIC_METALLURGY,
+                        crate::research::TECH_DRILL_OPTIMIZATION,
+                    ],
+                );
+            }
+
+            harness.run_for_ticks(ticks);
+            harness
+                .state()
+                .structure_registry
+                .get_facility(drill)
+                .unwrap()
+                .output_inventory
+                .total_quantity(game_types::RES_IRON_ORE)
+        }
+
+        let baseline = ore_after(150, false);
+        let upgraded = ore_after(150, true);
+        assert!(baseline > 0, "baseline drill produced nothing");
+        assert!(
+            upgraded > baseline,
+            "research did not increase mining output: {upgraded} vs {baseline}"
+        );
+    }
+
+    /// Power research raises subnet generation and lowers subnet demand.
+    #[test]
+    fn test_research_modifier_boosts_power_network_end_to_end() {
+        let mut harness = TestHarness::new();
+        m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Generator,
+            (0.0, 0.0, 0.0),
+        );
+        m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Refinery,
+            (8.0, 0.0, 0.0),
+        );
+        harness.step_tick();
+
+        let base_gen =
+            harness.state().structure_registry.power_network.subnets()[0].total_generation_kw;
+        let base_dem =
+            harness.state().structure_registry.power_network.subnets()[0].total_demand_kw;
+
+        m19_grant(&mut harness, &[crate::research::TECH_POWER_REGULATION]);
+        harness.step_tick();
+
+        let new_gen =
+            harness.state().structure_registry.power_network.subnets()[0].total_generation_kw;
+        let new_dem = harness.state().structure_registry.power_network.subnets()[0].total_demand_kw;
+
+        assert!(new_gen > base_gen, "generation patch not applied");
+        assert!(new_dem < base_dem, "efficiency patch not applied");
+    }
+
+    /// Logistics research raises dock throughput and depot coverage.
+    #[test]
+    fn test_research_modifier_boosts_logistics_end_to_end() {
+        let mut harness = TestHarness::new();
+        m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Generator,
+            (0.0, 0.0, 0.0),
+        );
+        let depot = m19_build(
+            &mut harness,
+            crate::structure::StructureKind::Depot,
+            (8.0, 0.0, 0.0),
+        );
+        harness.step_tick();
+
+        let depot_ent = EntityId::new(depot.value());
+        let base_coverage = harness
+            .state()
+            .structure_registry
+            .logistics
+            .depots
+            .get(&depot_ent)
+            .unwrap()
+            .effective_coverage();
+
+        m19_grant(
+            &mut harness,
+            &[
+                crate::research::TECH_POWER_REGULATION,
+                crate::research::TECH_LOGISTICS_PROTOCOLS,
+            ],
+        );
+
+        assert_eq!(
+            harness
+                .state()
+                .structure_registry
+                .logistics
+                .throughput_multiplier_milli,
+            1250
+        );
+        let new_coverage = harness
+            .state()
+            .structure_registry
+            .logistics
+            .depots
+            .get(&depot_ent)
+            .unwrap()
+            .effective_coverage();
+        assert!(
+            new_coverage > base_coverage,
+            "coverage patch not applied: {new_coverage} vs {base_coverage}"
+        );
+    }
+
+    /// Repair research restores more integrity per unit of the SAME material.
+    #[test]
+    fn test_research_modifier_boosts_repair_rate_end_to_end() {
+        fn repaired_hp(with_research: bool) -> u32 {
+            let mut harness = TestHarness::new();
+            let wall = m19_build(
+                &mut harness,
+                crate::structure::StructureKind::DEFAULT_WALL,
+                (20.0, 0.0, 20.0),
+            );
+            let actor = harness.create_entity(FactionId::new(1), RegionId::new(1));
+            harness
+                .state_mut()
+                .create_container(actor, ContainerKind::Backpack);
+            harness
+                .state_mut()
+                .inventory_mut(actor)
+                .unwrap()
+                .add(game_types::RES_STONE, 1)
+                .unwrap();
+
+            if with_research {
+                m19_grant(
+                    &mut harness,
+                    &[
+                        crate::research::TECH_BASIC_METALLURGY,
+                        crate::research::TECH_ADVANCED_ALLOYS,
+                        crate::research::TECH_FIELD_REPAIR_PATCH,
+                    ],
+                );
+            }
+
+            let mut journal = EventJournal::new();
+            harness
+                .state_mut()
+                .structure_registry
+                .apply_damage(
+                    wall,
+                    crate::wall::DamageSpec {
+                        raw_damage: 300.0,
+                        armor_penetration: 1000.0,
+                        source: None,
+                    },
+                    SimTick::new(1),
+                    &mut journal,
+                )
+                .unwrap();
+
+            harness
+                .state_mut()
+                .repair_structure(FactionId::null(), wall, actor)
+                .unwrap()
+                .hp_restored
+        }
+
+        let baseline = repaired_hp(false);
+        let upgraded = repaired_hp(true);
+        assert!(baseline > 0);
+        assert!(
+            upgraded > baseline,
+            "repair patch not applied: {upgraded} vs {baseline}"
+        );
+    }
+
+    /// Research is faction-scoped: one faction's patches never leak to another.
+    #[test]
+    fn test_research_modifiers_are_faction_scoped() {
+        let mut harness = TestHarness::new();
+        m19_grant(&mut harness, &[crate::research::TECH_POWER_REGULATION]);
+        let modifiers = &harness.state().structure_registry.modifiers;
+        assert_eq!(
+            modifiers.multiplier_milli(
+                FactionId::new(1),
+                crate::modifier::ModifierKind::PowerGeneration
+            ),
+            1100
+        );
+        assert_eq!(
+            modifiers.multiplier_milli(
+                FactionId::new(2),
+                crate::modifier::ModifierKind::PowerGeneration
+            ),
+            1000
+        );
+    }
+
+    /// Two independently-seeded harnesses running the identical research script
+    /// produce bit-identical modifier state.
+    #[test]
+    fn test_research_is_deterministic_across_identical_runs() {
+        fn run_script() -> Vec<(crate::modifier::ModifierKind, i64)> {
+            let mut harness = TestHarness::with_seed(99);
+            m19_build(
+                &mut harness,
+                crate::structure::StructureKind::Generator,
+                (0.0, 0.0, 0.0),
+            );
+            let lab = m19_build(
+                &mut harness,
+                crate::structure::StructureKind::ResearchFacility,
+                (8.0, 0.0, 0.0),
+            );
+            harness.step_tick();
+            let facility = harness
+                .state_mut()
+                .research_manager
+                .facility_mut(lab)
+                .unwrap();
+            facility
+                .input_inventory
+                .add(game_types::RES_STEEL, 20)
+                .unwrap();
+            facility
+                .input_inventory
+                .add(game_types::RES_ENERGY_CELL, 5)
+                .unwrap();
+            let _ = harness
+                .state_mut()
+                .queue_research(FactionId::new(1), crate::research::TECH_BASIC_METALLURGY);
+            let _ = harness
+                .state_mut()
+                .queue_research(FactionId::new(1), crate::research::TECH_POWER_REGULATION);
+            harness.run_for_ticks(400);
+            harness
+                .state()
+                .research_manager
+                .modifiers
+                .active_kinds(FactionId::new(1))
+        }
+
+        let a = run_script();
+        let b = run_script();
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
     }
 }

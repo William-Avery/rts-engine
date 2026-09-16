@@ -1,8 +1,35 @@
+use anti_cheat::manifest::{BuildManifest, ContentManifest, ServerPolicy};
+use anti_cheat::provider::AntiCheatMode;
 use game_protocol::threaded::{ThreadedAuthoritativeServer, ThreadedServerConfig};
 use game_protocol::transport::UdpTransport;
-use sim_core::test_harness::TestSimState;
+use game_protocol::version::PROTOCOL_VERSION;
+use sim_core::world::WorldState;
 use std::env;
 use std::time::Duration;
+
+/// Build identifier advertised in this server's manifest.
+const BUILD_ID: &str = concat!("rts-engine-", env!("CARGO_PKG_VERSION"));
+
+/// Build the server's own build/protocol/content manifest.
+///
+/// The content hash is rolled up from the content packs the server has loaded.
+/// Milestone 29 (mod/data boundary and content pipeline) will register real
+/// data-driven packs here; until then the built-in content set is registered
+/// under a single well-known name so the hash is still meaningful and stable.
+fn server_manifest(official: bool) -> BuildManifest {
+    let mut content = ContentManifest::new();
+    content.insert_bytes("builtin", BUILD_ID.as_bytes());
+    let mut manifest = BuildManifest::from_content(BUILD_ID, PROTOCOL_VERSION, &content);
+    manifest.official = official;
+    manifest
+}
+
+/// Read the value following `--flag` / `-f` on the command line.
+fn flag_value<'a>(args: &'a [String], long: &str, short: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == long || w[0] == short)
+        .map(|w| w[1].as_str())
+}
 
 fn main() {
     println!("============================================================");
@@ -33,6 +60,33 @@ fn main() {
 
     let dry_run = args.iter().any(|a| a == "--dry-run");
 
+    // Anti-cheat is opt-in. Omitting the flag leaves it disabled, which is the
+    // supported configuration for local development and single-player.
+    let anti_cheat = flag_value(&args, "--anti-cheat", "-a")
+        .map(|v| {
+            AntiCheatMode::parse(v).unwrap_or_else(|| {
+                eprintln!("Unknown --anti-cheat value '{v}'; expected 'off' or 'basic'.");
+                AntiCheatMode::Disabled
+            })
+        })
+        .unwrap_or_default();
+
+    let server_policy = match flag_value(&args, "--server-policy", "-s").unwrap_or("local") {
+        "official" => ServerPolicy::Official,
+        "private" => ServerPolicy::PrivateCustom {
+            accepted_manifest_hash: None,
+        },
+        "local" => ServerPolicy::LocalDev,
+        other => {
+            eprintln!(
+                "Unknown --server-policy value '{other}'; expected 'local', 'private' or 'official'."
+            );
+            ServerPolicy::LocalDev
+        }
+    };
+
+    let build_manifest = server_manifest(matches!(server_policy, ServerPolicy::Official));
+
     let bind_addr = format!("0.0.0.0:{port}");
     println!("Binding UDP network transport to {bind_addr}...");
 
@@ -53,7 +107,7 @@ fn main() {
         .expect("Failed to split UDP transport for multithreaded I/O");
 
     // Bootstrap world regions
-    let mut sim_state = TestSimState::new();
+    let mut sim_state = WorldState::new();
     let grid_regions = sim_core::region::RegionMap::create_grid(
         -1000.0,
         -1000.0,
@@ -72,6 +126,9 @@ fn main() {
         tick_rate_hz,
         worker_threads,
         timeout_ticks: 150,
+        anti_cheat,
+        server_policy: server_policy.clone(),
+        build_manifest: build_manifest.clone(),
     };
 
     println!("[Topology] Thread Architecture:");
@@ -80,6 +137,22 @@ fn main() {
     println!("  - Simulation Tick Loop:   Active ({tick_rate_hz} Hz deterministic cadence)");
     println!("  - Background Worker Pool: {worker_threads} worker threads");
     println!("  - World Regions:          {region_count} regions initialized");
+    println!("[Security] Server Policy & Anti-Cheat:");
+    println!(
+        "  - Anti-Cheat Provider:    {} ({})",
+        anti_cheat.as_str(),
+        if anti_cheat == AntiCheatMode::Disabled {
+            "server authority remains the primary defence"
+        } else {
+            "internal heuristics, no proprietary SDK required"
+        }
+    );
+    println!("  - Server Policy:          {}", server_policy.as_str());
+    println!("  - Build Manifest:         {build_manifest}");
+    println!(
+        "  - Manifest Hash:          {:#018x}",
+        build_manifest.manifest_hash()
+    );
 
     let handle = ThreadedAuthoritativeServer::start(tx, rx, config, Some(sim_state));
     println!("Multithreaded server online and ready for client connections.");

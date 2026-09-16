@@ -13,6 +13,11 @@ pub struct GameClientNet<T: Transport> {
     transport: T,
     pub state: SessionState,
     pub session_id: SessionId,
+    /// Capability token the server issued for this session at handshake.
+    ///
+    /// Stamped on every outbound command packet: the server accepts a command
+    /// only when the token and the datagram source both match the session.
+    pub session_token: u64,
     pub client_name: String,
     pub server_tick: SimTick,
     next_sequence: u64,
@@ -25,6 +30,7 @@ impl<T: Transport> GameClientNet<T> {
             transport,
             state: SessionState::Connecting,
             session_id: SessionId::null(),
+            session_token: 0,
             client_name,
             server_tick: SimTick::zero(),
             next_sequence: 1,
@@ -79,7 +85,8 @@ impl<T: Transport> GameClientNet<T> {
         let seq = self.next_sequence;
         self.next_sequence += 1;
 
-        let envelope = CommandEnvelope::new(self.session_id, seq, self.server_tick, command);
+        let envelope = CommandEnvelope::new(self.session_id, seq, self.server_tick, command)
+            .with_token(self.session_token);
         let packet = Packet::new_command(envelope);
         self.transport.send(packet)?;
         Ok(seq)
@@ -99,9 +106,11 @@ impl<T: Transport> GameClientNet<T> {
                     session_id,
                     server_tick,
                     reject_reason,
+                    session_token,
                 }) => {
                     if accepted {
                         self.session_id = session_id;
+                        self.session_token = session_token;
                         self.server_tick = server_tick;
                         self.state = SessionState::Active;
                     } else {

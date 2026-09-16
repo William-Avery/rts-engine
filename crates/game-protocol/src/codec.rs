@@ -1,7 +1,7 @@
 use crate::packet::{Packet, PacketHeader, PacketPayload};
 use crate::snapshot::{DeltaEnvelope, EntitySnapshot, SnapshotEnvelope};
 use crate::version::{HandshakeMessage, ProtocolError, ProtocolResult};
-use game_types::{EntityId, FactionId, ItemId, RegionId, ResourceId, SessionId, SimTick};
+use game_types::{EntityId, FactionId, RegionId, ResourceId, SessionId, SimTick};
 use sim_core::command::{ActionType, Command, CommandEnvelope, RobotCommandType};
 
 /// Encodes a protocol packet into a binary byte buffer.
@@ -31,11 +31,13 @@ pub fn encode_packet(packet: &Packet) -> Vec<u8> {
                     session_id,
                     server_tick,
                     reject_reason,
+                    session_token,
                 } => {
                     buf.push(2); // sub-type 2
                     buf.push(if *accepted { 1 } else { 0 });
                     buf.extend_from_slice(&session_id.value().to_le_bytes());
                     buf.extend_from_slice(&server_tick.value().to_le_bytes());
+                    buf.extend_from_slice(&session_token.to_le_bytes());
                     if let Some(reason) = reject_reason {
                         buf.push(1);
                         encode_string(&mut buf, reason);
@@ -54,6 +56,8 @@ pub fn encode_packet(packet: &Packet) -> Vec<u8> {
             buf.extend_from_slice(&envelope.session_id.value().to_le_bytes());
             buf.extend_from_slice(&envelope.sequence.to_le_bytes());
             buf.extend_from_slice(&envelope.client_tick.value().to_le_bytes());
+            // Session capability token (Milestone A1 session binding).
+            buf.extend_from_slice(&envelope.token.to_le_bytes());
             encode_command(&mut buf, &envelope.command);
         }
         PacketPayload::Snapshot(snapshot) => {
@@ -123,6 +127,7 @@ pub fn decode_packet(buf: &[u8]) -> ProtocolResult<Packet> {
                     let accepted = read_u8(buf, &mut cursor)? != 0;
                     let sid = SessionId::new(read_u64(buf, &mut cursor)?);
                     let tick = SimTick::new(read_u64(buf, &mut cursor)?);
+                    let session_token = read_u64(buf, &mut cursor)?;
                     let has_reason = read_u8(buf, &mut cursor)? != 0;
                     let reject_reason = if has_reason {
                         Some(decode_string(buf, &mut cursor)?)
@@ -134,6 +139,7 @@ pub fn decode_packet(buf: &[u8]) -> ProtocolResult<Packet> {
                         session_id: sid,
                         server_tick: tick,
                         reject_reason,
+                        session_token,
                     })
                 }
                 3 => {
@@ -156,8 +162,11 @@ pub fn decode_packet(buf: &[u8]) -> ProtocolResult<Packet> {
             let sid = SessionId::new(read_u64(buf, &mut cursor)?);
             let seq = read_u64(buf, &mut cursor)?;
             let client_tick = SimTick::new(read_u64(buf, &mut cursor)?);
+            let token = read_u64(buf, &mut cursor)?;
             let cmd = decode_command(buf, &mut cursor)?;
-            PacketPayload::Command(CommandEnvelope::new(sid, seq, client_tick, cmd))
+            PacketPayload::Command(
+                CommandEnvelope::new(sid, seq, client_tick, cmd).with_token(token),
+            )
         }
         3 => {
             // Snapshot
@@ -282,16 +291,6 @@ fn encode_command(buf: &mut Vec<u8>, cmd: &Command) {
                 buf.push(0);
             }
         }
-        Command::Build {
-            position,
-            structure_id,
-        } => {
-            buf.push(3);
-            buf.extend_from_slice(&position.0.to_le_bytes());
-            buf.extend_from_slice(&position.1.to_le_bytes());
-            buf.extend_from_slice(&position.2.to_le_bytes());
-            buf.extend_from_slice(&structure_id.value().to_le_bytes());
-        }
         Command::RobotCommand {
             robot_id,
             command_type,
@@ -332,10 +331,6 @@ fn encode_command(buf: &mut Vec<u8>, cmd: &Command) {
             buf.extend_from_slice(&resource_id.value().to_le_bytes());
             buf.extend_from_slice(&amount.to_le_bytes());
         }
-        Command::Research { tech_id } => {
-            buf.push(6);
-            buf.extend_from_slice(&tech_id.value().to_le_bytes());
-        }
         Command::TransferRegion {
             entity_id,
             destination_region,
@@ -364,6 +359,7 @@ fn encode_command(buf: &mut Vec<u8>, cmd: &Command) {
                 sim_core::structure::StructureKind::Battery => 9,
                 sim_core::structure::StructureKind::MiningDrill => 10,
                 sim_core::structure::StructureKind::Refinery => 11,
+                sim_core::structure::StructureKind::ResearchFacility => 12,
             };
             buf.push(k_code);
             buf.extend_from_slice(&position.0.to_le_bytes());
@@ -479,6 +475,97 @@ fn encode_command(buf: &mut Vec<u8>, cmd: &Command) {
             buf.extend_from_slice(&job_id.value().to_le_bytes());
             buf.extend_from_slice(&worker_id.value().to_le_bytes());
         }
+        Command::AssignEscort { player, robot_id } => {
+            buf.push(30);
+            buf.extend_from_slice(&player.value().to_le_bytes());
+            buf.extend_from_slice(&robot_id.value().to_le_bytes());
+        }
+        Command::ReleaseEscort { player, robot_id } => {
+            buf.push(31);
+            buf.extend_from_slice(&player.value().to_le_bytes());
+            buf.extend_from_slice(&robot_id.value().to_le_bytes());
+        }
+        Command::AssignSquadMember { squad_id, robot_id } => {
+            buf.push(32);
+            buf.extend_from_slice(&squad_id.value().to_le_bytes());
+            buf.extend_from_slice(&robot_id.value().to_le_bytes());
+        }
+        Command::RemoveSquadMember { squad_id, robot_id } => {
+            buf.push(33);
+            buf.extend_from_slice(&squad_id.value().to_le_bytes());
+            buf.extend_from_slice(&robot_id.value().to_le_bytes());
+        }
+        Command::SquadRegroup {
+            squad_id,
+            rally_position,
+        } => {
+            buf.push(34);
+            buf.extend_from_slice(&squad_id.value().to_le_bytes());
+            buf.extend_from_slice(&rally_position.0.to_le_bytes());
+            buf.extend_from_slice(&rally_position.1.to_le_bytes());
+            buf.extend_from_slice(&rally_position.2.to_le_bytes());
+        }
+        // Milestone 19 reserved discriminant range: 100-109.
+        Command::QueueResearch { tech_id } => {
+            buf.push(100);
+            buf.extend_from_slice(&tech_id.value().to_le_bytes());
+        }
+        Command::CancelResearch { job_id } => {
+            buf.push(101);
+            buf.extend_from_slice(&job_id.value().to_le_bytes());
+        }
+        Command::ReorderResearchQueue { job_id, new_index } => {
+            buf.push(102);
+            buf.extend_from_slice(&job_id.value().to_le_bytes());
+            buf.extend_from_slice(&new_index.to_le_bytes());
+        }
+        // Milestone 25 reserved discriminant range: 160-169.
+        Command::SubmitClientManifest {
+            build_id,
+            protocol_version,
+            content_hash,
+            official_build,
+        } => {
+            buf.push(160);
+            encode_string(buf, build_id);
+            buf.extend_from_slice(&protocol_version.to_le_bytes());
+            buf.extend_from_slice(&content_hash.to_le_bytes());
+            buf.push(if *official_build { 1 } else { 0 });
+        }
+        Command::AdminKickSession {
+            target_session,
+            reason_code,
+        } => {
+            buf.push(161);
+            buf.extend_from_slice(&target_session.value().to_le_bytes());
+            buf.push(*reason_code);
+        }
+        Command::AdminSetTrustLevel {
+            target_session,
+            trust_code,
+        } => {
+            buf.push(162);
+            buf.extend_from_slice(&target_session.value().to_le_bytes());
+            buf.push(*trust_code);
+        }
+        Command::AdminGrantResource {
+            target_entity,
+            resource_id,
+            amount,
+        } => {
+            buf.push(163);
+            buf.extend_from_slice(&target_entity.value().to_le_bytes());
+            buf.extend_from_slice(&resource_id.value().to_le_bytes());
+            buf.extend_from_slice(&amount.to_le_bytes());
+        }
+        Command::AdminSetSessionRole {
+            target_session,
+            role_code,
+        } => {
+            buf.push(164);
+            buf.extend_from_slice(&target_session.value().to_le_bytes());
+            buf.push(*role_code);
+        }
     }
 }
 
@@ -525,16 +612,13 @@ fn decode_command(buf: &[u8], cursor: &mut usize) -> ProtocolResult<Command> {
                 target,
             })
         }
-        3 => {
-            let px = read_f32(buf, cursor)?;
-            let py = read_f32(buf, cursor)?;
-            let pz = read_f32(buf, cursor)?;
-            let structure_id = ItemId::new(read_u16(buf, cursor)?);
-            Ok(Command::Build {
-                position: (px, py, pz),
-                structure_id,
-            })
-        }
+        // Discriminant 3 was the placeholder `Build` command, superseded by
+        // `BuildStructure` (discriminant 30) and now retired. It is refused
+        // rather than reused so a stale client cannot silently mean something
+        // else on a newer server.
+        3 => Err(ProtocolError::SerializationError(
+            "Retired command discriminant 3 (Build); use BuildStructure".to_string(),
+        )),
         4 => {
             let robot_id = EntityId::new(read_u64(buf, cursor)?);
             let r_code = read_u8(buf, cursor)?;
@@ -581,10 +665,12 @@ fn decode_command(buf: &[u8], cursor: &mut usize) -> ProtocolResult<Command> {
                 amount,
             })
         }
-        6 => {
-            let tech_id = ItemId::new(read_u16(buf, cursor)?);
-            Ok(Command::Research { tech_id })
-        }
+        // Discriminant 6 held the Milestone 1 placeholder `Research { tech_id: ItemId }`
+        // command. It was superseded by `QueueResearch` (100) in Milestone 19 and is
+        // permanently retired so no two code paths can queue research.
+        6 => Err(ProtocolError::SerializationError(
+            "Command type 6 (legacy Research) is retired; use QueueResearch (100)".to_string(),
+        )),
         7 => {
             let entity_id = EntityId::new(read_u64(buf, cursor)?);
             let destination_region = RegionId::new(read_u32(buf, cursor)?);
@@ -609,6 +695,7 @@ fn decode_command(buf: &[u8], cursor: &mut usize) -> ProtocolResult<Command> {
                 9 => sim_core::structure::StructureKind::Battery,
                 10 => sim_core::structure::StructureKind::MiningDrill,
                 11 => sim_core::structure::StructureKind::Refinery,
+                12 => sim_core::structure::StructureKind::ResearchFacility,
                 _ => {
                     return Err(ProtocolError::SerializationError(format!(
                         "Invalid structure kind: {k_code}"
@@ -732,6 +819,97 @@ fn decode_command(buf: &[u8], cursor: &mut usize) -> ProtocolResult<Command> {
             let job_id = game_types::LogisticsJobId::new(read_u64(buf, cursor)?);
             let worker_id = EntityId::new(read_u64(buf, cursor)?);
             Ok(Command::ExecuteLogisticsDropoff { job_id, worker_id })
+        }
+        30 => {
+            let player = game_types::PlayerId::new(read_u32(buf, cursor)?);
+            let robot_id = EntityId::new(read_u64(buf, cursor)?);
+            Ok(Command::AssignEscort { player, robot_id })
+        }
+        31 => {
+            let player = game_types::PlayerId::new(read_u32(buf, cursor)?);
+            let robot_id = EntityId::new(read_u64(buf, cursor)?);
+            Ok(Command::ReleaseEscort { player, robot_id })
+        }
+        32 => {
+            let squad_id = game_types::SquadId::new(read_u32(buf, cursor)?);
+            let robot_id = EntityId::new(read_u64(buf, cursor)?);
+            Ok(Command::AssignSquadMember { squad_id, robot_id })
+        }
+        33 => {
+            let squad_id = game_types::SquadId::new(read_u32(buf, cursor)?);
+            let robot_id = EntityId::new(read_u64(buf, cursor)?);
+            Ok(Command::RemoveSquadMember { squad_id, robot_id })
+        }
+        34 => {
+            let squad_id = game_types::SquadId::new(read_u32(buf, cursor)?);
+            let rx = read_f32(buf, cursor)?;
+            let ry = read_f32(buf, cursor)?;
+            let rz = read_f32(buf, cursor)?;
+            Ok(Command::SquadRegroup {
+                squad_id,
+                rally_position: (rx, ry, rz),
+            })
+        }
+        // Milestone 19 reserved discriminant range: 100-109.
+        100 => {
+            let tech_id = game_types::TechId::new(read_u32(buf, cursor)?);
+            Ok(Command::QueueResearch { tech_id })
+        }
+        101 => {
+            let job_id = game_types::ResearchJobId::new(read_u64(buf, cursor)?);
+            Ok(Command::CancelResearch { job_id })
+        }
+        102 => {
+            let job_id = game_types::ResearchJobId::new(read_u64(buf, cursor)?);
+            let new_index = read_u16(buf, cursor)?;
+            Ok(Command::ReorderResearchQueue { job_id, new_index })
+        }
+        // Milestone 25 reserved discriminant range: 160-169.
+        160 => {
+            let build_id = decode_string(buf, cursor)?;
+            let protocol_version = read_u32(buf, cursor)?;
+            let content_hash = read_u64(buf, cursor)?;
+            let official_build = read_u8(buf, cursor)? != 0;
+            Ok(Command::SubmitClientManifest {
+                build_id,
+                protocol_version,
+                content_hash,
+                official_build,
+            })
+        }
+        161 => {
+            let target_session = SessionId::new(read_u64(buf, cursor)?);
+            let reason_code = read_u8(buf, cursor)?;
+            Ok(Command::AdminKickSession {
+                target_session,
+                reason_code,
+            })
+        }
+        162 => {
+            let target_session = SessionId::new(read_u64(buf, cursor)?);
+            let trust_code = read_u8(buf, cursor)?;
+            Ok(Command::AdminSetTrustLevel {
+                target_session,
+                trust_code,
+            })
+        }
+        163 => {
+            let target_entity = EntityId::new(read_u64(buf, cursor)?);
+            let resource_id = ResourceId::new(read_u16(buf, cursor)?);
+            let amount = read_u32(buf, cursor)?;
+            Ok(Command::AdminGrantResource {
+                target_entity,
+                resource_id,
+                amount,
+            })
+        }
+        164 => {
+            let target_session = SessionId::new(read_u64(buf, cursor)?);
+            let role_code = read_u8(buf, cursor)?;
+            Ok(Command::AdminSetSessionRole {
+                target_session,
+                role_code,
+            })
         }
         other => Err(ProtocolError::SerializationError(format!(
             "Invalid command type code: {other}"

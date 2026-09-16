@@ -28,6 +28,11 @@ pub struct DebugHud {
     pub logistics_jobs_completed: u64,
     pub logistics_jobs_starved: usize,
     pub logistics_docks_count: usize,
+    pub research_techs_completed: usize,
+    pub research_techs_total: usize,
+    pub research_queue_depth: usize,
+    pub research_active_progress: f32,
+    pub research_active_modifiers: usize,
 }
 
 impl Default for DebugHud {
@@ -58,6 +63,11 @@ impl Default for DebugHud {
             logistics_jobs_completed: 0,
             logistics_jobs_starved: 0,
             logistics_docks_count: 0,
+            research_techs_completed: 0,
+            research_techs_total: 0,
+            research_queue_depth: 0,
+            research_active_progress: 0.0,
+            research_active_modifiers: 0,
         }
     }
 }
@@ -216,6 +226,20 @@ impl DebugHud {
             out.push_str(&format!(
                 "| Facilities: {:>3} active | Cycles Completed: {:>8}             |\n",
                 self.production_facilities_count, self.production_cycles_total
+            ));
+        }
+        if self.research_techs_total > 0 {
+            out.push_str("+--------------------------------------------------------------+\n");
+            out.push_str(&format!(
+                "| Research: {:>3} / {:<3} done | Queue: {:>2} | Progress: {:>5.1}%     |\n",
+                self.research_techs_completed,
+                self.research_techs_total,
+                self.research_queue_depth,
+                self.research_active_progress * 100.0
+            ));
+            out.push_str(&format!(
+                "| Active Software Patches (modifier kinds): {:>3}                |\n",
+                self.research_active_modifiers
             ));
         }
         out.push_str("+--------------------------------------------------------------+\n");

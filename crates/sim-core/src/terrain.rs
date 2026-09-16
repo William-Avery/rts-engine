@@ -1,3 +1,11 @@
+//! Authoritative collision world and movement validation.
+//!
+//! This module is the **single source of truth** for "where may a body be".
+//! It lives in `sim-core` because the server, not the client, owns player
+//! position: `dispatch::apply_command` runs [`validate_authoritative_movement`]
+//! for every `Command::Move`, and `game-client` re-exports the same types so
+//! client-side prediction runs byte-identical arithmetic.
+
 /// Axis-aligned 3D bounding box for static world obstacles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObstacleAabb {
@@ -89,6 +97,14 @@ pub struct GreyboxTerrain {
     pub obstacles: Vec<ObstacleAabb>,
 }
 
+impl Default for GreyboxTerrain {
+    /// The authoritative default play area, matching the `world_bounds_xz` the
+    /// structure placement path validates against.
+    fn default() -> Self {
+        GreyboxTerrain::new((-500.0, 500.0), (-500.0, 500.0))
+    }
+}
+
 impl GreyboxTerrain {
     pub fn new(bounds_x: (f32, f32), bounds_z: (f32, f32)) -> Self {
         GreyboxTerrain {
@@ -136,6 +152,11 @@ impl GreyboxTerrain {
         self.obstacles.push(obstacle);
     }
 
+    /// Authoritative `(min_x, max_x, min_z, max_z)` play area.
+    pub fn bounds_xz(&self) -> (f32, f32, f32, f32) {
+        (self.min_x, self.max_x, self.min_z, self.max_z)
+    }
+
     pub fn is_point_inside_bounds(&self, x: f32, z: f32) -> bool {
         x >= self.min_x && x <= self.max_x && z >= self.min_z && z <= self.max_z
     }
@@ -181,5 +202,163 @@ impl GreyboxTerrain {
 
         // Re-clamp to bounds after obstacle displacement
         self.clamp_to_bounds(pos, radius)
+    }
+}
+
+/// Movement physics configuration for walking, sprinting, jumping, and collision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovementConfig {
+    pub walk_speed: f32,
+    pub sprint_speed: f32,
+    pub acceleration: f32,
+    pub deceleration: f32,
+    pub jump_velocity: f32,
+    pub gravity: f32,
+    pub radius: f32,
+    pub height: f32,
+}
+
+impl Default for MovementConfig {
+    fn default() -> Self {
+        MovementConfig {
+            walk_speed: 6.0,
+            sprint_speed: 10.0,
+            acceleration: 40.0,
+            deceleration: 30.0,
+            jump_velocity: 7.5,
+            gravity: 19.6,
+            radius: 0.4,
+            height: 1.8,
+        }
+    }
+}
+
+/// Authoritative movement validation that evaluates a client requested movement,
+/// enforcing maximum legal speed limits and terrain collision clamping.
+///
+/// Returns the authoritative clamped position and whether illegal movement was detected.
+///
+/// A non-finite request is refused outright by returning `previous_pos` and
+/// `true`: NaN makes every comparison below evaluate to `false`, so it must
+/// never be allowed to reach the clamping arithmetic.
+pub fn validate_authoritative_movement(
+    previous_pos: (f32, f32, f32),
+    requested_pos: (f32, f32, f32),
+    dt: f32,
+    terrain: &GreyboxTerrain,
+    config: &MovementConfig,
+) -> ((f32, f32, f32), bool) {
+    if !requested_pos.0.is_finite() || !requested_pos.1.is_finite() || !requested_pos.2.is_finite()
+    {
+        return (previous_pos, true);
+    }
+
+    let dt_clamped = dt.clamp(0.001, 0.5);
+    // Allow sprint speed plus a 10% network/float tolerance margin
+    let max_legal_distance = config.sprint_speed * dt_clamped * 1.10;
+
+    let dx = requested_pos.0 - previous_pos.0;
+    let dy = requested_pos.1 - previous_pos.1;
+    let dz = requested_pos.2 - previous_pos.2;
+    let attempted_distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    let mut illegal = false;
+    let target_pos = if attempted_distance > max_legal_distance {
+        illegal = true;
+        let scale = max_legal_distance / attempted_distance;
+        (
+            previous_pos.0 + dx * scale,
+            previous_pos.1 + dy * scale,
+            previous_pos.2 + dz * scale,
+        )
+    } else {
+        requested_pos
+    };
+
+    // Authoritative collision resolution against terrain
+    let resolved = terrain.resolve_movement(target_pos, config.radius, config.height);
+    if resolved != requested_pos {
+        illegal = true;
+    }
+
+    (resolved, illegal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a6_server_clamps_a_teleport_to_a_reachable_step() {
+        let terrain = GreyboxTerrain::default();
+        let config = MovementConfig::default();
+        let (pos, illegal) = validate_authoritative_movement(
+            (0.0, 0.0, 0.0),
+            (50_000.0, 0.0, 0.0),
+            1.0 / 30.0,
+            &terrain,
+            &config,
+        );
+        assert!(illegal, "a 50 km step must be flagged illegal");
+        assert!(pos.0 < 1.0, "server accepted a client teleport: {pos:?}");
+    }
+
+    #[test]
+    fn test_a6_server_clamps_movement_to_world_bounds() {
+        let terrain = GreyboxTerrain::new((-10.0, 10.0), (-10.0, 10.0));
+        let config = MovementConfig::default();
+        // dt large enough that the speed clamp does not fire: only bounds do.
+        let (pos, illegal) = validate_authoritative_movement(
+            (9.0, 0.0, 0.0),
+            (11.0, 0.0, 0.0),
+            0.5,
+            &terrain,
+            &config,
+        );
+        assert!(illegal);
+        assert!(
+            pos.0 <= 10.0 - config.radius + 1e-4,
+            "out of bounds: {pos:?}"
+        );
+    }
+
+    #[test]
+    fn test_a6_non_finite_request_is_refused_without_touching_position() {
+        let terrain = GreyboxTerrain::default();
+        let config = MovementConfig::default();
+        let (pos, illegal) = validate_authoritative_movement(
+            (3.0, 0.0, 4.0),
+            (f32::NAN, 0.0, f32::INFINITY),
+            1.0 / 30.0,
+            &terrain,
+            &config,
+        );
+        assert!(illegal);
+        assert_eq!(pos, (3.0, 0.0, 4.0));
+    }
+
+    #[test]
+    fn test_a6_legal_step_is_accepted_unchanged() {
+        let terrain = GreyboxTerrain::default();
+        let config = MovementConfig::default();
+        let (pos, illegal) = validate_authoritative_movement(
+            (0.0, 0.0, 0.0),
+            (0.2, 0.0, 0.0),
+            1.0 / 30.0,
+            &terrain,
+            &config,
+        );
+        assert!(!illegal);
+        assert_eq!(pos, (0.2, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_obstacle_resolution_pushes_body_out() {
+        let terrain = GreyboxTerrain::default_arena();
+        let resolved = terrain.resolve_movement((0.0, 0.0, 0.0), 0.4, 1.8);
+        assert!(
+            !terrain.check_collision(resolved, 0.4, 1.8),
+            "body left inside an obstacle: {resolved:?}"
+        );
     }
 }

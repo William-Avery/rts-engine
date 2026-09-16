@@ -1,6 +1,7 @@
 use crate::event::{EventJournal, SimEvent};
 use crate::inventory::Inventory;
 use crate::logistics::{DepotLogistics, LogisticsDock, LogisticsManager};
+use crate::modifier::{ModifierKind, ModifierStore};
 use crate::power::{PowerNetwork, PowerNode, PowerPriority, PowerSpec, PowerStatus};
 use crate::production::{FacilityKind, ProductionFacility, ResourceDeposit};
 use crate::wall::{DamageResult, DamageSpec, RepairResult, WallTier, calculate_wall_damage};
@@ -12,7 +13,7 @@ use game_types::{
 use std::collections::BTreeMap;
 
 /// Type classification for world structures.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum StructureKind {
     Wall(WallTier),
     Pylon,
@@ -23,6 +24,8 @@ pub enum StructureKind {
     Battery,
     MiningDrill,
     Refinery,
+    /// Laboratory running the faction research queue and distributing software patches.
+    ResearchFacility,
 }
 
 impl StructureKind {
@@ -40,6 +43,7 @@ impl StructureKind {
             StructureKind::Battery => (1.5, 1.5, 1.5),   // 3m x 3m x 3m
             StructureKind::MiningDrill => (2.0, 2.0, 2.0), // 4m x 4m x 4m
             StructureKind::Refinery => (3.5, 3.0, 3.5),  // 7m x 6m x 7m
+            StructureKind::ResearchFacility => (3.0, 2.5, 3.0), // 6m x 5m x 6m
         };
 
         // If rotated 90 or 270 degrees, swap X and Z extents
@@ -62,20 +66,22 @@ impl StructureKind {
             StructureKind::Battery => 1000,
             StructureKind::MiningDrill => 2000,
             StructureKind::Refinery => 3500,
+            StructureKind::ResearchFacility => 2800,
         }
     }
 
     pub fn construction_ticks(&self) -> u32 {
         match self {
             StructureKind::Wall(tier) => tier.archetype().construction_ticks,
-            StructureKind::Pylon => 30,       // 1.0s at 30 Hz
-            StructureKind::Depot => 90,       // 3.0s at 30 Hz
-            StructureKind::Turret => 60,      // 2.0s at 30 Hz
-            StructureKind::Fabricator => 120, // 4.0s at 30 Hz
-            StructureKind::Generator => 60,   // 2.0s at 30 Hz
-            StructureKind::Battery => 45,     // 1.5s at 30 Hz
-            StructureKind::MiningDrill => 90, // 3.0s at 30 Hz
-            StructureKind::Refinery => 120,   // 4.0s at 30 Hz
+            StructureKind::Pylon => 30,             // 1.0s at 30 Hz
+            StructureKind::Depot => 90,             // 3.0s at 30 Hz
+            StructureKind::Turret => 60,            // 2.0s at 30 Hz
+            StructureKind::Fabricator => 120,       // 4.0s at 30 Hz
+            StructureKind::Generator => 60,         // 2.0s at 30 Hz
+            StructureKind::Battery => 45,           // 1.5s at 30 Hz
+            StructureKind::MiningDrill => 90,       // 3.0s at 30 Hz
+            StructureKind::Refinery => 120,         // 4.0s at 30 Hz
+            StructureKind::ResearchFacility => 150, // 5.0s at 30 Hz
         }
     }
 
@@ -103,6 +109,11 @@ impl StructureKind {
             StructureKind::Refinery => {
                 &[(RES_STEEL, 50), (RES_STONE, 30), (RES_BASIC_COMPONENTS, 10)]
             }
+            StructureKind::ResearchFacility => &[
+                (RES_STEEL, 45),
+                (RES_BASIC_COMPONENTS, 15),
+                (RES_ENERGY_CELL, 10),
+            ],
         }
     }
 
@@ -179,6 +190,17 @@ impl StructureKind {
             StructureKind::Refinery => PowerSpec {
                 generation_kw: 0,
                 demand_kw: 50,
+                storage_capacity_kwh: 0,
+                max_charge_rate_kw: 0,
+                max_discharge_rate_kw: 0,
+                connection_range: 0.0,
+                distribution_range: 0.0,
+                is_relay: false,
+                priority: PowerPriority::Normal,
+            },
+            StructureKind::ResearchFacility => PowerSpec {
+                generation_kw: 0,
+                demand_kw: 60,
                 storage_capacity_kwh: 0,
                 max_charge_rate_kw: 0,
                 max_discharge_rate_kw: 0,
@@ -315,7 +337,7 @@ impl Structure {
 /// Compact spatial representation for wall segments.
 /// Stores wall cells using integer coordinates (e.g. 2m cells) and tier bytes,
 /// achieving ultra-compact memory footprint (<1MB for 100k+ walls) and O(1) spatial queries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompactWallGrid {
     /// Map of (grid_x, grid_z) -> (wall_tier, faction_id).
     cells: BTreeMap<(i32, i32), (u8, FactionId)>,
@@ -405,7 +427,7 @@ pub enum StructureEvent {
 
 /// Central authoritative structure manager coordinating placement validation,
 /// atomic concurrency reservation, lifecycle progression, and compact wall representations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StructureRegistry {
     pub structures: BTreeMap<StructureId, Structure>,
     pub reserved_cells: BTreeMap<(i32, i32), StructureId>,
@@ -416,6 +438,11 @@ pub struct StructureRegistry {
     pub logistics: LogisticsManager,
     pub next_id: u64,
     pub max_interaction_reach: f32,
+    /// Replica of the authoritative faction modifier network owned by
+    /// `ResearchManager`, distributed here as a software patch so every
+    /// structure-side system (production, power, logistics, repair) can read it
+    /// without reaching across registries. Updated via [`StructureRegistry::install_modifier_patch`].
+    pub modifiers: ModifierStore,
 }
 
 impl Default for StructureRegistry {
@@ -430,6 +457,7 @@ impl Default for StructureRegistry {
             logistics: LogisticsManager::new(),
             next_id: 1,
             max_interaction_reach: 15.0,
+            modifiers: ModifierStore::new(),
         }
     }
 }
@@ -759,21 +787,65 @@ impl StructureRegistry {
             }
         }
 
-        // Advance industrial production facilities
+        // Advance industrial production facilities under the distributed patch set
         for (facility_id, facility) in &mut self.facilities {
             if let Some(structure) = self.structures.get(facility_id)
                 && structure.state.is_operational()
             {
+                let mods = crate::production::ProductionModifiers::from_store(
+                    &self.modifiers,
+                    structure.faction_id,
+                );
                 let _ = facility.tick(
                     structure.power_status,
                     current_tick,
                     &mut self.deposits,
                     journal,
+                    mods,
                 );
             }
         }
 
         events
+    }
+
+    /// Install a faction modifier patch published by the research network.
+    ///
+    /// Returns `true` when the local replica changed. Power generation, power
+    /// efficiency, and logistics throughput are re-derived immediately so the
+    /// next tick already runs under the new patch.
+    pub fn install_modifier_patch(&mut self, patch: &ModifierStore) -> bool {
+        if !self.modifiers.install_patch(patch) {
+            return false;
+        }
+        self.republish_modifier_derived_state();
+        true
+    }
+
+    /// Push freshly-derived modifier values into the subsystems that cache them.
+    fn republish_modifier_derived_state(&mut self) {
+        for faction in self.modifiers.factions() {
+            self.power_network.set_faction_power_modifiers(
+                faction,
+                self.modifiers
+                    .multiplier_milli(faction, ModifierKind::PowerGeneration),
+                self.modifiers
+                    .multiplier_milli(faction, ModifierKind::PowerEfficiency),
+            );
+        }
+
+        // The logistics manager is currently single-faction scoped; use the
+        // lowest registered faction's throughput and coverage patch.
+        if let Some(faction) = self.modifiers.factions().first().copied() {
+            self.logistics.set_throughput_multiplier_milli(
+                self.modifiers
+                    .multiplier_milli(faction, ModifierKind::TransportThroughput),
+            );
+            self.logistics.set_coverage_multiplier_milli(
+                self.modifiers
+                    .multiplier_milli(faction, ModifierKind::LogisticsCoverage),
+            );
+        }
     }
 
     pub fn remove_structure(&mut self, id: StructureId) -> Option<Structure> {
@@ -884,6 +956,7 @@ impl StructureRegistry {
     /// Authoritatively repair a structure using repair materials from an inventory.
     pub fn request_repair(
         &mut self,
+        actor_faction: FactionId,
         id: StructureId,
         inventory: &mut Inventory,
         tick: SimTick,
@@ -894,18 +967,33 @@ impl StructureRegistry {
             .get_mut(&id)
             .ok_or(GameError::StructureNotFound(id))?;
 
+        // A session may only repair its own faction's buildings, and only from
+        // a container its own faction owns.
+        authorize_faction(actor_faction, structure.faction_id)?;
+        if !inventory.is_accessible_by(actor_faction) {
+            return Err(GameError::PermissionDenied);
+        }
+
         let (current_hp, max_hp) = match structure.state {
             StructureState::Constructed { current_hp, max_hp } => (current_hp, max_hp),
             _ => return Err(GameError::InvalidStructureState),
         };
 
-        let (repair_res, hp_per_unit) = match structure.kind {
+        let (repair_res, base_hp_per_unit) = match structure.kind {
             StructureKind::Wall(tier) => {
                 let arch = tier.archetype();
                 (arch.repair_resource, arch.repair_hp_per_unit)
             }
             _ => (RES_STEEL, 50.0),
         };
+
+        // Research patches make each unit of material restore more integrity;
+        // they never create material out of nothing.
+        let hp_per_unit = self.modifiers.value_for(
+            structure.faction_id,
+            ModifierKind::RepairRate,
+            base_hp_per_unit,
+        );
 
         if current_hp >= max_hp {
             return Ok(RepairResult {
@@ -1005,6 +1093,7 @@ impl StructureRegistry {
     /// Authoritatively configure an industrial recipe for a facility.
     pub fn set_production_recipe(
         &mut self,
+        actor_faction: FactionId,
         id: StructureId,
         recipe_id: RecipeId,
     ) -> GameResult<()> {
@@ -1012,12 +1101,14 @@ impl StructureRegistry {
             .facilities
             .get_mut(&id)
             .ok_or(GameError::StructureNotFound(id))?;
+        authorize_faction(actor_faction, facility.faction_id)?;
         facility.set_recipe(recipe_id)
     }
 
     /// Authoritatively assign a target deposit for a mining drill.
     pub fn set_extraction_target(
         &mut self,
+        actor_faction: FactionId,
         id: StructureId,
         deposit_id: DepositId,
     ) -> GameResult<()> {
@@ -1025,6 +1116,7 @@ impl StructureRegistry {
             .facilities
             .get_mut(&id)
             .ok_or(GameError::StructureNotFound(id))?;
+        authorize_faction(actor_faction, facility.faction_id)?;
         if facility.kind != FacilityKind::MiningDrill {
             return Err(GameError::InvalidStructureState);
         }
@@ -1034,6 +1126,18 @@ impl StructureRegistry {
 
     pub fn count(&self) -> usize {
         self.structures.len()
+    }
+}
+
+/// Reject an actor faction acting on something another faction owns.
+///
+/// A null actor faction is server/internal authority; a null owner is neutral
+/// world property.
+pub fn authorize_faction(actor_faction: FactionId, owner_faction: FactionId) -> GameResult<()> {
+    if actor_faction.is_null() || owner_faction.is_null() || actor_faction == owner_faction {
+        Ok(())
+    } else {
+        Err(GameError::PermissionDenied)
     }
 }
 
@@ -1467,7 +1571,13 @@ mod tests {
         inv.add(RES_STONE, 3).unwrap();
 
         let rep_res1 = registry
-            .request_repair(id, &mut inv, SimTick::new(6), &mut journal)
+            .request_repair(
+                FactionId::null(),
+                id,
+                &mut inv,
+                SimTick::new(6),
+                &mut journal,
+            )
             .unwrap();
 
         assert_eq!(rep_res1.hp_restored, 150);
@@ -1480,7 +1590,13 @@ mod tests {
         inv.add(RES_STONE, 5).unwrap();
 
         let rep_res2 = registry
-            .request_repair(id, &mut inv, SimTick::new(7), &mut journal)
+            .request_repair(
+                FactionId::null(),
+                id,
+                &mut inv,
+                SimTick::new(7),
+                &mut journal,
+            )
             .unwrap();
 
         assert_eq!(rep_res2.hp_restored, 50);
@@ -1490,7 +1606,13 @@ mod tests {
 
         // Wall is at 100% health: repairing again does not consume materials
         let rep_res3 = registry
-            .request_repair(id, &mut inv, SimTick::new(8), &mut journal)
+            .request_repair(
+                FactionId::null(),
+                id,
+                &mut inv,
+                SimTick::new(8),
+                &mut journal,
+            )
             .unwrap();
         assert_eq!(rep_res3.hp_restored, 0);
         assert_eq!(rep_res3.units_consumed, 0);

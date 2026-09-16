@@ -20,7 +20,7 @@ cargo run -p sim-bench -- --output benchmark_report.json
 cargo run -p sim-bench -- --scenario 10k_walls
 ```
 
-## Baseline Targets vs Measured Performance (Milestones 3 - 11)
+## Baseline Targets vs Measured Performance (Milestones 3 - 12)
 
 Measured on AMD64 Windows development environment:
 
@@ -34,6 +34,8 @@ Measured on AMD64 Windows development environment:
 | `power_grid_1k` | 1,000 | 16 | 60 | 84.885 | 1414.76 µs | ~707 | 104 KB |
 | `production_chain_1k` | 1,000 | 16 | 60 | 149.115 | 2485.25 µs | ~402 | 104 KB |
 | `logistics_jobs_1k` | 1,350 | 16 | 60 | 2.089 | 34.81 µs | ~28,725 | 134 KB |
+| `robots_1k` | 1,000 | 16 | 60 | 158.871 | 2647.85 µs | ~378 | 104 KB |
+| `research_modifiers_1k` | 1,000 | 16 | 300 | 466.833 | 1556.11 µs | ~643 | 104 KB |
 
 ## Regional Activity Breakdown
 
@@ -47,6 +49,8 @@ Measured on AMD64 Windows development environment:
 | `power_grid_1k` | 960 / 0 | 0 / 0 | 0 / 0 | 0 |
 | `production_chain_1k` | 960 / 0 | 0 / 0 | 0 / 0 | 0 |
 | `logistics_jobs_1k` | 960 / 21,000 | 0 / 0 | 0 / 0 | 0 |
+| `robots_1k` | 960 / 60,480 | 0 / 0 | 0 / 0 | 0 |
+| `research_modifiers_1k` | 4,800 / 0 | 0 / 0 | 0 / 0 | 0 |
 
 ## Key Findings
 
@@ -55,3 +59,5 @@ Measured on AMD64 Windows development environment:
 3. **Event & Message Queue Throughput**: Over 24,000 cross-region messages were routed and dispatched across 16 regions in ~3.3 ms (~7.5 million messages/second routing throughput) under backpressure policies.
 4. **Logistics Engine Efficiency**: 1,000 jobs across 100 depots, 250 haulers, and 16 regions run at ~28,700 ticks/sec (~34.8 µs per tick) in only 134 KB of memory with abstract bulk cargo and Dijkstra shortest-path route evaluation.
 5. **Decoupled Multithreaded Server**: Dedicated network ingress and egress threads allow packet receiving and snapshot broadcasting to execute concurrently with the authoritative 30 Hz simulation loop and background worker pool.
+6. **Biped Robot Framework Scalability**: 1,000 bipeds — 16 player escorts plus 40 regrouping squads across 16 hot regions — step navigation, local separation, movement integration, and facing in 2,648 µs/tick in the debug profile (~378 ticks/sec) and **538 µs/tick in the release profile (~1,860 ticks/sec, ~62x the 30 Hz simulation budget)** in 104 KB of state. Neighbour queries use a per-step uniform grid rather than an O(n²) sweep, so cost scales with local crowding, not total robot count.
+7. **Research & Modifier Evaluation Scale**: `research_modifiers_1k` runs 500 powered research laboratories paired with 500 generators across 64 factions and 16 regions. In 300 ticks it queues 128 research jobs, starts all 128, and completes all 128 (each publishing a faction-wide modifier patch), while additionally performing 102,400 modifier evaluations (64 factions x 16 modifier kinds x 100 passes). Measured at 1556.11 µs/tick (~643 ticks/sec) in the debug profile used for every row above, and 245.34 µs/tick (~4,076 ticks/sec) with `--release`. Modifier evaluation is exact integer fixed-point arithmetic over `BTreeMap` buckets, so it adds no floating-point drift and no ordering sensitivity at this scale.

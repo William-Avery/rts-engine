@@ -1,8 +1,8 @@
 use crate::event::{EventJournal, SimEvent};
 use crate::inventory::{ContainerKind, InventoryRegistry};
 use game_types::{
-    EntityId, GameError, GameResult, LogisticsJobId, ReservationId, ResourceId, RouteNodeId,
-    SimTick,
+    EntityId, FactionId, GameError, GameResult, LogisticsJobId, ReservationId, ResourceId,
+    RouteNodeId, SimTick,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -65,6 +65,10 @@ pub enum WorkerRequirement {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LogisticsJob {
     pub id: LogisticsJobId,
+    /// Faction that owns this job. Only this faction may claim it, execute its
+    /// pickup and dropoff, or cancel it. `FactionId::null()` marks a job the
+    /// simulation generated for itself.
+    pub owner_faction: FactionId,
     pub source: EntityId,
     pub destination: EntityId,
     pub resource_id: ResourceId,
@@ -82,27 +86,24 @@ pub struct LogisticsJob {
 }
 
 impl LogisticsJob {
-    pub fn new(
-        id: LogisticsJobId,
-        source: EntityId,
-        destination: EntityId,
-        resource_id: ResourceId,
-        amount: u32,
-        priority: JobPriority,
-        created_tick: SimTick,
-    ) -> Self {
+    /// Build a job from the request that asked for it.
+    ///
+    /// Takes the request whole rather than eight positional arguments so the
+    /// owner faction and the two endpoint entities cannot be transposed.
+    pub fn new(id: LogisticsJobId, request: &JobRequest) -> Self {
         LogisticsJob {
             id,
-            source,
-            destination,
-            resource_id,
-            amount,
-            priority,
+            owner_faction: request.actor_faction,
+            source: request.source,
+            destination: request.destination,
+            resource_id: request.resource_id,
+            amount: request.amount,
+            priority: request.priority,
             status: JobStatus::Pending,
             worker_req: WorkerRequirement::SingleWorker,
             claimed_workers: Vec::new(),
             reservation_id: None,
-            created_tick,
+            created_tick: request.tick,
             assigned_tick: None,
             completed_tick: None,
             starvation_threshold_ticks: 300, // 10s at 30 Hz
@@ -138,7 +139,7 @@ pub struct DockServiceSession {
 }
 
 /// Logistics dock managing berth occupancy and rate-limited cargo transfers without physics collision.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogisticsDock {
     pub dock_entity: EntityId,
     pub berths: usize,
@@ -184,6 +185,8 @@ pub struct DepotLogistics {
     pub depot_entity: EntityId,
     pub base_coverage_radius: f32,
     pub is_powered: bool,
+    /// Research coverage patch in fixed-point thousandths (`1000` == neutral).
+    pub coverage_multiplier_milli: i64,
 }
 
 impl DepotLogistics {
@@ -192,13 +195,15 @@ impl DepotLogistics {
             depot_entity,
             base_coverage_radius,
             is_powered: true, // Default to powered until power network update
+            coverage_multiplier_milli: crate::modifier::MODIFIER_SCALE,
         }
     }
 
-    /// Effective coverage radius gated by electrical power.
+    /// Effective coverage radius gated by electrical power and scaled by research.
     pub fn effective_coverage(&self) -> f32 {
         if self.is_powered {
-            self.base_coverage_radius
+            self.base_coverage_radius * (self.coverage_multiplier_milli as f32)
+                / (crate::modifier::MODIFIER_SCALE as f32)
         } else {
             0.0
         }
@@ -237,7 +242,7 @@ pub struct RouteEdge {
 }
 
 /// Network route graph for stable, non-colliding material transport corridors.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct RouteGraph {
     pub nodes: BTreeMap<RouteNodeId, RouteNode>,
     pub edges: Vec<RouteEdge>,
@@ -411,8 +416,24 @@ pub struct LogisticsTelemetry {
     pub deadlocked_docks_count: usize,
 }
 
+/// Parameters for creating one authoritative logistics job.
+///
+/// A struct rather than a positional argument list so the actor faction cannot
+/// be silently swapped for another id at a call site.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct JobRequest {
+    /// Faction requesting the job. Becomes the job owner.
+    pub actor_faction: FactionId,
+    pub source: EntityId,
+    pub destination: EntityId,
+    pub resource_id: ResourceId,
+    pub amount: u32,
+    pub priority: JobPriority,
+    pub tick: SimTick,
+}
+
 /// Server-authoritative logistics coordinator managing jobs, docks, depots, and transactions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogisticsManager {
     pub jobs: BTreeMap<LogisticsJobId, LogisticsJob>,
     pub docks: BTreeMap<EntityId, LogisticsDock>,
@@ -421,6 +442,10 @@ pub struct LogisticsManager {
     pub distant_transports: Vec<DistantTransport>,
     pub next_job_id: u64,
     pub telemetry: LogisticsTelemetry,
+    /// Research transport throughput patch in thousandths (`1000` == neutral).
+    pub throughput_multiplier_milli: i64,
+    /// Research depot coverage patch in thousandths (`1000` == neutral).
+    pub coverage_multiplier_milli: i64,
 }
 
 impl Default for LogisticsManager {
@@ -439,6 +464,8 @@ impl LogisticsManager {
             distant_transports: Vec::new(),
             next_job_id: 1,
             telemetry: LogisticsTelemetry::default(),
+            throughput_multiplier_milli: crate::modifier::MODIFIER_SCALE,
+            coverage_multiplier_milli: crate::modifier::MODIFIER_SCALE,
         }
     }
 
@@ -448,8 +475,26 @@ impl LogisticsManager {
     }
 
     /// Register depot logistics coverage parameters.
-    pub fn register_depot(&mut self, depot: DepotLogistics) {
+    pub fn register_depot(&mut self, mut depot: DepotLogistics) {
+        depot.coverage_multiplier_milli = self.coverage_multiplier_milli;
         self.depots.insert(depot.depot_entity, depot);
+    }
+
+    /// Install the research transport throughput patch for dock service rates.
+    pub fn set_throughput_multiplier_milli(&mut self, milli: i64) {
+        self.throughput_multiplier_milli = milli.max(0);
+    }
+
+    /// Install the research coverage patch across every registered depot.
+    pub fn set_coverage_multiplier_milli(&mut self, milli: i64) {
+        let clamped = milli.max(0);
+        if self.coverage_multiplier_milli == clamped {
+            return;
+        }
+        self.coverage_multiplier_milli = clamped;
+        for depot in self.depots.values_mut() {
+            depot.coverage_multiplier_milli = clamped;
+        }
     }
 
     /// Update depot power status from electrical network.
@@ -460,49 +505,46 @@ impl LogisticsManager {
     }
 
     /// Create and submit a new logistics material transport job.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The requesting faction must own both endpoints: a job debits its source
+    /// and credits its destination, so accepting a foreign source is a direct
+    /// resource-theft primitive.
     pub fn create_job(
         &mut self,
-        source: EntityId,
-        destination: EntityId,
-        resource_id: ResourceId,
-        amount: u32,
-        priority: JobPriority,
-        tick: SimTick,
+        request: JobRequest,
+        inventory_registry: &InventoryRegistry,
         journal: &mut EventJournal,
     ) -> GameResult<LogisticsJobId> {
-        if amount == 0 {
+        if request.amount == 0 {
             return Err(GameError::InvalidCommand);
         }
-        if source == destination {
+        if request.source == request.destination {
             return Err(GameError::InvalidCommand);
         }
+        authorize_container(inventory_registry, request.actor_faction, request.source)?;
+        authorize_container(
+            inventory_registry,
+            request.actor_faction,
+            request.destination,
+        )?;
 
         let job_id = LogisticsJobId::new(self.next_job_id);
         self.next_job_id += 1;
 
-        let job = LogisticsJob::new(
-            job_id,
-            source,
-            destination,
-            resource_id,
-            amount,
-            priority,
-            tick,
-        );
+        let job = LogisticsJob::new(job_id, &request);
         self.jobs.insert(job_id, job);
 
         self.telemetry.jobs_created_total += 1;
         self.telemetry.jobs_pending_count += 1;
 
         journal.record(
-            tick,
+            request.tick,
             SimEvent::LogisticsJobCreated {
                 job_id,
-                resource_id,
-                amount,
-                source,
-                destination,
+                resource_id: request.resource_id,
+                amount: request.amount,
+                source: request.source,
+                destination: request.destination,
             },
         );
 
@@ -518,6 +560,7 @@ impl LogisticsManager {
     ///    cannot be double-spent or claimed by another job.
     pub fn claim_job(
         &mut self,
+        actor_faction: FactionId,
         job_id: LogisticsJobId,
         worker_id: EntityId,
         tick: SimTick,
@@ -528,6 +571,8 @@ impl LogisticsManager {
             .jobs
             .get_mut(&job_id)
             .ok_or(GameError::JobNotFound(job_id))?;
+
+        authorize_job(job, actor_faction)?;
 
         if job.status != JobStatus::Pending && job.status != JobStatus::Claimed {
             return Err(GameError::InvalidJobState);
@@ -580,6 +625,7 @@ impl LogisticsManager {
     /// Zero resource duplication or loss.
     pub fn execute_pickup(
         &mut self,
+        actor_faction: FactionId,
         job_id: LogisticsJobId,
         worker_id: EntityId,
         tick: SimTick,
@@ -590,6 +636,8 @@ impl LogisticsManager {
             .jobs
             .get_mut(&job_id)
             .ok_or(GameError::JobNotFound(job_id))?;
+
+        authorize_job(job, actor_faction)?;
 
         if job.status != JobStatus::Claimed {
             return Err(GameError::InvalidJobState);
@@ -649,6 +697,7 @@ impl LogisticsManager {
     /// Zero resource duplication or loss.
     pub fn execute_dropoff(
         &mut self,
+        actor_faction: FactionId,
         job_id: LogisticsJobId,
         worker_id: EntityId,
         tick: SimTick,
@@ -659,6 +708,8 @@ impl LogisticsManager {
             .jobs
             .get_mut(&job_id)
             .ok_or(GameError::JobNotFound(job_id))?;
+
+        authorize_job(job, actor_faction)?;
 
         if job.status != JobStatus::InTransit {
             return Err(GameError::InvalidJobState);
@@ -714,6 +765,7 @@ impl LogisticsManager {
     /// Cancel a logistics job and cleanly release any active reservations without item loss.
     pub fn cancel_job(
         &mut self,
+        actor_faction: FactionId,
         job_id: LogisticsJobId,
         reason: &str,
         tick: SimTick,
@@ -724,6 +776,8 @@ impl LogisticsManager {
             .jobs
             .get_mut(&job_id)
             .ok_or(GameError::JobNotFound(job_id))?;
+
+        authorize_job(job, actor_faction)?;
 
         if job.status == JobStatus::Completed || job.status == JobStatus::Cancelled {
             return Err(GameError::InvalidJobState);
@@ -774,6 +828,7 @@ impl LogisticsManager {
         journal: &mut EventJournal,
     ) {
         // 1. Advance logistics docks
+        let throughput_milli = self.throughput_multiplier_milli;
         let mut completed_sessions: Vec<(EntityId, DockServiceSession)> = Vec::new();
         for (dock_ent, dock) in self.docks.iter_mut() {
             let mut progressed = false;
@@ -809,8 +864,13 @@ impl LogisticsManager {
                 }
             }
 
-            // Step active service sessions
-            let rate = dock.service_rate_units_per_tick;
+            // Step active service sessions under the research throughput patch
+            let rate = {
+                let base = dock.service_rate_units_per_tick as i64;
+                let scaled =
+                    base.saturating_mul(throughput_milli) / crate::modifier::MODIFIER_SCALE;
+                scaled.clamp(1, u32::MAX as i64) as u32
+            };
             for session in &mut dock.servicing {
                 session.units_remaining = session.units_remaining.saturating_sub(rate);
                 progressed = true;
@@ -840,6 +900,7 @@ impl LogisticsManager {
             match session.action {
                 DockAction::Pickup => {
                     let _ = self.execute_pickup(
+                        FactionId::null(),
                         session.job_id,
                         session.worker_id,
                         tick,
@@ -849,6 +910,7 @@ impl LogisticsManager {
                 }
                 DockAction::Dropoff => {
                     let _ = self.execute_dropoff(
+                        FactionId::null(),
                         session.job_id,
                         session.worker_id,
                         tick,
@@ -872,6 +934,7 @@ impl LogisticsManager {
 
         for transport in arrived_transports {
             let _ = self.execute_dropoff(
+                FactionId::null(),
                 transport.job_id,
                 transport.hauler_entity,
                 tick,
@@ -978,14 +1041,48 @@ impl LogisticsManager {
         }
 
         self.create_job(
-            source,
-            destination,
-            resource_id,
-            amount,
-            priority,
-            tick,
+            JobRequest {
+                // Simulation-generated replenishment, not a client request.
+                actor_faction: FactionId::null(),
+                source,
+                destination,
+                resource_id,
+                amount,
+                priority,
+                tick,
+            },
+            inventory_registry,
             journal,
         )
+    }
+}
+
+/// Reject an actor that does not own `job`.
+fn authorize_job(job: &LogisticsJob, actor_faction: FactionId) -> GameResult<()> {
+    if actor_faction.is_null() || job.owner_faction.is_null() || job.owner_faction == actor_faction
+    {
+        Ok(())
+    } else {
+        Err(GameError::PermissionDenied)
+    }
+}
+
+/// Reject an actor that does not own the container behind `entity`.
+///
+/// An entity with no container at all passes: the caller's own lookup produces
+/// the specific `ContainerNotFound` error.
+fn authorize_container(
+    registry: &InventoryRegistry,
+    actor_faction: FactionId,
+    entity: EntityId,
+) -> GameResult<()> {
+    if actor_faction.is_null() {
+        return Ok(());
+    }
+    match registry.get(entity).map(|inv| inv.owner_faction) {
+        None => Ok(()),
+        Some(owner) if owner.is_null() || owner == actor_faction => Ok(()),
+        Some(_) => Err(GameError::PermissionDenied),
     }
 }
 
@@ -1017,18 +1114,23 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_IRON_ORE,
-                50,
-                JobPriority::Normal,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_IRON_ORE,
+                    amount: 50,
+                    priority: JobPriority::Normal,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
 
         // Hauler 1 claims successfully
         let res1 = mgr.claim_job(
+            FactionId::null(),
             job_id,
             hauler_1,
             SimTick::new(2),
@@ -1039,6 +1141,7 @@ mod tests {
 
         // Hauler 2 attempts to claim same job -> must fail with JobAlreadyClaimed
         let res2 = mgr.claim_job(
+            FactionId::null(),
             job_id,
             hauler_2,
             SimTick::new(2),
@@ -1049,6 +1152,7 @@ mod tests {
 
         // Hauler 3 attempts to claim same job -> must fail with JobAlreadyClaimed
         let res3 = mgr.claim_job(
+            FactionId::null(),
             job_id,
             hauler_3,
             SimTick::new(2),
@@ -1085,12 +1189,16 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_STEEL,
-                100,
-                JobPriority::High,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_STEEL,
+                    amount: 100,
+                    priority: JobPriority::High,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
@@ -1100,15 +1208,36 @@ mod tests {
             WorkerRequirement::MultiWorker { max_workers: 2 };
 
         assert!(
-            mgr.claim_job(job_id, w1, SimTick::new(2), &mut inv_reg, &mut journal)
-                .is_ok()
+            mgr.claim_job(
+                FactionId::null(),
+                job_id,
+                w1,
+                SimTick::new(2),
+                &mut inv_reg,
+                &mut journal
+            )
+            .is_ok()
         );
         assert!(
-            mgr.claim_job(job_id, w2, SimTick::new(2), &mut inv_reg, &mut journal)
-                .is_ok()
+            mgr.claim_job(
+                FactionId::null(),
+                job_id,
+                w2,
+                SimTick::new(2),
+                &mut inv_reg,
+                &mut journal
+            )
+            .is_ok()
         );
         // Worker 3 exceeds cap 2 -> fails
-        let res3 = mgr.claim_job(job_id, w3, SimTick::new(2), &mut inv_reg, &mut journal);
+        let res3 = mgr.claim_job(
+            FactionId::null(),
+            job_id,
+            w3,
+            SimTick::new(2),
+            &mut inv_reg,
+            &mut journal,
+        );
         assert!(matches!(res3, Err(GameError::JobAlreadyClaimed(_))));
     }
 
@@ -1135,19 +1264,30 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_STEEL,
-                80,
-                JobPriority::Normal,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_STEEL,
+                    amount: 80,
+                    priority: JobPriority::Normal,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
 
         // Claim
-        mgr.claim_job(job_id, hauler, SimTick::new(2), &mut inv_reg, &mut journal)
-            .unwrap();
+        mgr.claim_job(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(2),
+            &mut inv_reg,
+            &mut journal,
+        )
+        .unwrap();
         assert_eq!(
             inv_reg.get(source).unwrap().available_quantity(RES_STEEL),
             120
@@ -1163,8 +1303,15 @@ mod tests {
         assert_eq!(total_claimed, 200, "Zero loss or duplication during claim");
 
         // Execute pickup
-        mgr.execute_pickup(job_id, hauler, SimTick::new(3), &mut inv_reg, &mut journal)
-            .unwrap();
+        mgr.execute_pickup(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(3),
+            &mut inv_reg,
+            &mut journal,
+        )
+        .unwrap();
         assert_eq!(inv_reg.get(source).unwrap().total_quantity(RES_STEEL), 120);
         assert_eq!(inv_reg.get(hauler).unwrap().total_quantity(RES_STEEL), 80);
         assert_eq!(inv_reg.get(dest).unwrap().total_quantity(RES_STEEL), 0);
@@ -1178,8 +1325,15 @@ mod tests {
         );
 
         // Execute dropoff
-        mgr.execute_dropoff(job_id, hauler, SimTick::new(4), &mut inv_reg, &mut journal)
-            .unwrap();
+        mgr.execute_dropoff(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(4),
+            &mut inv_reg,
+            &mut journal,
+        )
+        .unwrap();
         assert_eq!(inv_reg.get(source).unwrap().total_quantity(RES_STEEL), 120);
         assert_eq!(inv_reg.get(hauler).unwrap().total_quantity(RES_STEEL), 0);
         assert_eq!(inv_reg.get(dest).unwrap().total_quantity(RES_STEEL), 80);
@@ -1217,24 +1371,48 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_TUNGSTEN_ORE,
-                50,
-                JobPriority::Normal,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_TUNGSTEN_ORE,
+                    amount: 50,
+                    priority: JobPriority::Normal,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
 
-        mgr.claim_job(job_id, hauler, SimTick::new(2), &mut inv_reg, &mut journal)
-            .unwrap();
-        mgr.execute_pickup(job_id, hauler, SimTick::new(3), &mut inv_reg, &mut journal)
-            .unwrap();
+        mgr.claim_job(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(2),
+            &mut inv_reg,
+            &mut journal,
+        )
+        .unwrap();
+        mgr.execute_pickup(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(3),
+            &mut inv_reg,
+            &mut journal,
+        )
+        .unwrap();
 
         // Attempt dropoff into destination that cannot accept -> fails
-        let dropoff_res =
-            mgr.execute_dropoff(job_id, hauler, SimTick::new(4), &mut inv_reg, &mut journal);
+        let dropoff_res = mgr.execute_dropoff(
+            FactionId::null(),
+            job_id,
+            hauler,
+            SimTick::new(4),
+            &mut inv_reg,
+            &mut journal,
+        );
         assert!(matches!(dropoff_res, Err(GameError::InventoryFull { .. })));
 
         // Hauler still has all 50 items safely stored
@@ -1401,12 +1579,16 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_IRON_ORE,
-                40,
-                JobPriority::Normal,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_IRON_ORE,
+                    amount: 40,
+                    priority: JobPriority::Normal,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
@@ -1450,12 +1632,16 @@ mod tests {
 
         let job_id = mgr
             .create_job(
-                source,
-                dest,
-                RES_STEEL,
-                20,
-                JobPriority::High,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source,
+                    destination: dest,
+                    resource_id: RES_STEEL,
+                    amount: 20,
+                    priority: JobPriority::High,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
@@ -1503,6 +1689,7 @@ mod tests {
     fn test_find_best_pending_job_prioritization() {
         let mut mgr = LogisticsManager::new();
         let mut journal = EventJournal::new();
+        let inv_reg = InventoryRegistry::new();
 
         let s1 = EntityId::new(1);
         let s2 = EntityId::new(2);
@@ -1512,45 +1699,61 @@ mod tests {
 
         let _j_low = mgr
             .create_job(
-                s1,
-                d,
-                RES_IRON_ORE,
-                10,
-                JobPriority::Low,
-                SimTick::new(1),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source: s1,
+                    destination: d,
+                    resource_id: RES_IRON_ORE,
+                    amount: 10,
+                    priority: JobPriority::Low,
+                    tick: SimTick::new(1),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
         let _j_norm = mgr
             .create_job(
-                s2,
-                d,
-                RES_IRON_ORE,
-                10,
-                JobPriority::Normal,
-                SimTick::new(2),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source: s2,
+                    destination: d,
+                    resource_id: RES_IRON_ORE,
+                    amount: 10,
+                    priority: JobPriority::Normal,
+                    tick: SimTick::new(2),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
         let _j_high = mgr
             .create_job(
-                s3,
-                d,
-                RES_IRON_ORE,
-                10,
-                JobPriority::High,
-                SimTick::new(3),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source: s3,
+                    destination: d,
+                    resource_id: RES_IRON_ORE,
+                    amount: 10,
+                    priority: JobPriority::High,
+                    tick: SimTick::new(3),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();
         let j_crit = mgr
             .create_job(
-                s4,
-                d,
-                RES_IRON_ORE,
-                10,
-                JobPriority::Critical,
-                SimTick::new(4),
+                JobRequest {
+                    actor_faction: FactionId::null(),
+                    source: s4,
+                    destination: d,
+                    resource_id: RES_IRON_ORE,
+                    amount: 10,
+                    priority: JobPriority::Critical,
+                    tick: SimTick::new(4),
+                },
+                &inv_reg,
                 &mut journal,
             )
             .unwrap();

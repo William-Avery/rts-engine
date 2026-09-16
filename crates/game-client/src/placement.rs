@@ -1,6 +1,6 @@
-use crate::terrain::GreyboxTerrain;
 use sim_core::command::Command;
 use sim_core::structure::{StructureKind, StructureRegistry};
+use sim_core::terrain::GreyboxTerrain;
 
 /// Placement preview validation status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

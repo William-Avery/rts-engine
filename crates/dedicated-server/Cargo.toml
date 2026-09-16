@@ -7,7 +7,13 @@ edition = "2024"
 name = "dedicated-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwards to `game-protocol/eos-eac`. Off by default; see docs/SECURITY.md.
+eos-eac = ["game-protocol/eos-eac"]
+
 [dependencies]
+anti-cheat = { path = "../anti-cheat" }
 sim-core = { path = "../sim-core" }
 game-types = { path = "../game-types" }
 game-protocol = { path = "../game-protocol" }

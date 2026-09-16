@@ -113,7 +113,7 @@ impl SimulationMetrics {
 }
 
 /// Configuration of tick intervals for multi-rate buckets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultiRateConfig {
     pub high_interval: u64,
     pub medium_interval: u64,
@@ -139,6 +139,19 @@ pub struct MultiRateScheduler {
     config: MultiRateConfig,
     wakeup_queue: BinaryHeap<ScheduledWakeup>,
     metrics: SimulationMetrics,
+}
+
+/// Hand-written because `BinaryHeap` has no `PartialEq`: two heaps holding the
+/// same wakeups may differ in internal array order, which is not a simulation
+/// difference. Comparing the sorted contents is the honest equality for a
+/// determinism assertion.
+impl PartialEq for MultiRateScheduler {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.metrics == other.metrics
+            && self.wakeup_queue.clone().into_sorted_vec()
+                == other.wakeup_queue.clone().into_sorted_vec()
+    }
 }
 
 impl Default for MultiRateScheduler {

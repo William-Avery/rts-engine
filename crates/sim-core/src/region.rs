@@ -69,7 +69,7 @@ impl RegionBounds {
 }
 
 /// A partition of the simulation world owning a set of entities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Region {
     pub id: RegionId,
     pub bounds: RegionBounds,
@@ -121,7 +121,7 @@ impl Region {
 }
 
 /// Fixed uniform grid layout for world partitioning into regions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegionGrid {
     pub origin_x: f32,
     pub origin_z: f32,
@@ -190,7 +190,7 @@ impl RegionGrid {
 }
 
 /// Manages world regions, spatial lookup, and strict entity-to-region ownership.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RegionMap {
     regions: BTreeMap<RegionId, Region>,
     entity_to_region: BTreeMap<EntityId, RegionId>,

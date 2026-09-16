@@ -7,10 +7,10 @@ use crate::interpolation::{EntitySample, InterpolationBuffer};
 use crate::logistics_view::LogisticsViewSnapshot;
 use crate::placement::PlacementGhost;
 use crate::prediction::{MovementInputSnapshot, PlayerState, PredictedController};
-use crate::terrain::GreyboxTerrain;
 use game_types::{EntityId, RegionId, SimTick, StructureId};
 use sim_core::command::Command;
 use sim_core::structure::{StructureKind, StructureRegistry, StructureState};
+use sim_core::terrain::GreyboxTerrain;
 use std::collections::BTreeMap;
 
 /// Presentation representation of a world structure.

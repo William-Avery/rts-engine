@@ -18,6 +18,11 @@ pub enum HandshakeMessage {
         session_id: SessionId,
         server_tick: SimTick,
         reject_reason: Option<String>,
+        /// Capability token the client must stamp on every command packet.
+        ///
+        /// Zero on a rejected handshake. This is the only time the token is
+        /// transmitted, and only to the peer that completed the handshake.
+        session_token: u64,
     },
     /// Explicit connection teardown
     Disconnect {

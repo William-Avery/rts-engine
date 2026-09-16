@@ -153,16 +153,44 @@ pub struct DamageResult {
     pub destroyed: bool,
 }
 
-/// Authoritative calculation of damage mitigation for a wall archetype.
-pub fn calculate_wall_damage(
-    archetype: &WallArchetype,
-    current_hp: u32,
-    damage: DamageSpec,
-) -> DamageResult {
-    let effective_armor = (archetype.flat_armor - damage.armor_penetration).max(0.0);
+/// Generic flat-armor plus percentage-resistance mitigation profile.
+///
+/// This is the single authoritative armor model in the simulation. Walls derive theirs
+/// from `WallArchetype`, mobile units derive theirs from their chassis armor class, so
+/// there is exactly one damage formula in the codebase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmorProfile {
+    pub flat_armor: f32,
+    /// Percentage damage mitigation in range [0.0, 1.0)
+    pub damage_reduction: f32,
+}
+
+impl ArmorProfile {
+    pub const fn new(flat_armor: f32, damage_reduction: f32) -> Self {
+        ArmorProfile {
+            flat_armor,
+            damage_reduction,
+        }
+    }
+
+    pub const fn unarmored() -> Self {
+        ArmorProfile::new(0.0, 0.0)
+    }
+}
+
+impl WallArchetype {
+    /// Armor mitigation profile for this wall tier.
+    pub const fn armor_profile(&self) -> ArmorProfile {
+        ArmorProfile::new(self.flat_armor, self.damage_reduction)
+    }
+}
+
+/// Authoritative calculation of damage mitigation against any armor profile.
+pub fn calculate_damage(armor: ArmorProfile, current_hp: u32, damage: DamageSpec) -> DamageResult {
+    let effective_armor = (armor.flat_armor - damage.armor_penetration).max(0.0);
     let post_armor = (damage.raw_damage - effective_armor).max(0.0);
     let absorbed_armor = damage.raw_damage - post_armor;
-    let effective_damage = post_armor * (1.0 - archetype.damage_reduction);
+    let effective_damage = post_armor * (1.0 - armor.damage_reduction);
     let mitigated_resistance = post_armor - effective_damage;
     let dmg_rounded = effective_damage.round() as u32;
 
@@ -180,6 +208,15 @@ pub fn calculate_wall_damage(
         remaining_hp,
         destroyed,
     }
+}
+
+/// Authoritative calculation of damage mitigation for a wall archetype.
+pub fn calculate_wall_damage(
+    archetype: &WallArchetype,
+    current_hp: u32,
+    damage: DamageSpec,
+) -> DamageResult {
+    calculate_damage(archetype.armor_profile(), current_hp, damage)
 }
 
 /// Outcome of an authoritative repair operation on a structure.
@@ -279,6 +316,23 @@ mod tests {
         assert!(res.effective_damage > 1000.0);
         assert_eq!(res.remaining_hp, 0);
         assert!(res.destroyed);
+    }
+
+    #[test]
+    fn test_generic_armor_profile_matches_wall_damage_path() {
+        // The generalized entry point and the wall-specific wrapper must agree exactly,
+        // proving mobile units and structures share one authoritative damage formula.
+        let spec = DamageSpec::new(140.0).with_penetration(10.0);
+        let wall_res = calculate_wall_damage(&MK2_STEEL_ARCHETYPE, 3000, spec);
+        let generic_res = calculate_damage(MK2_STEEL_ARCHETYPE.armor_profile(), 3000, spec);
+        assert_eq!(wall_res, generic_res);
+
+        // Unarmored profile passes raw damage through untouched.
+        let raw = calculate_damage(ArmorProfile::unarmored(), 500, DamageSpec::new(75.0));
+        assert_eq!(raw.absorbed_armor, 0.0);
+        assert_eq!(raw.mitigated_resistance, 0.0);
+        assert!((raw.effective_damage - 75.0).abs() < 1e-4);
+        assert_eq!(raw.remaining_hp, 425);
     }
 
     #[test]

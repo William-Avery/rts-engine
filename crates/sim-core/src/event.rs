@@ -24,7 +24,7 @@ impl EventId {
 }
 
 /// Simulation events for logging, debugging, and networking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SimEvent {
     /// Entity created
     EntityCreated {
@@ -93,8 +93,11 @@ pub enum SimEvent {
         success: bool,
         result: Option<String>,
     },
-    /// Research completed
-    ResearchCompleted { tech_id: game_types::ItemId },
+    /// Research completed and its unlocks/modifiers were applied
+    ResearchCompleted {
+        faction_id: game_types::FactionId,
+        tech_id: game_types::TechId,
+    },
     /// Power grid connected component updated
     PowerGridUpdated {
         grid_id: game_types::PowerGridId,
@@ -182,6 +185,100 @@ pub enum SimEvent {
         dock_entity: EntityId,
         queue_length: usize,
     },
+    /// Biped robot spawned into the authoritative robot registry
+    RobotSpawned {
+        robot: EntityId,
+        chassis: u8,
+        faction_id: game_types::FactionId,
+        position: (f32, f32, f32),
+    },
+    /// Robot received a new authoritative standing order
+    RobotOrderIssued { robot: EntityId, order_code: u8 },
+    /// Robot reached the goal of its current order
+    RobotArrived {
+        robot: EntityId,
+        position: (f32, f32, f32),
+    },
+    /// Robot destroyed and removed from the simulation
+    RobotDestroyed {
+        robot: EntityId,
+        source: Option<EntityId>,
+    },
+    /// Robot assigned as a player's personal escort
+    EscortAssigned {
+        player: game_types::PlayerId,
+        robot: EntityId,
+    },
+    /// Robot released from escort duty
+    EscortReleased {
+        player: game_types::PlayerId,
+        robot: EntityId,
+    },
+    /// Squad created
+    SquadFormed {
+        squad_id: game_types::SquadId,
+        leader: EntityId,
+        faction_id: game_types::FactionId,
+    },
+    /// Robot added to a squad roster
+    SquadMemberAssigned {
+        squad_id: game_types::SquadId,
+        robot: EntityId,
+    },
+    /// Robot removed from a squad roster
+    SquadMemberRemoved {
+        squad_id: game_types::SquadId,
+        robot: EntityId,
+    },
+    /// Squad ordered to reform on a rally point
+    SquadRegrouped {
+        squad_id: game_types::SquadId,
+        rally_position: (f32, f32, f32),
+        member_count: u32,
+    },
+    /// Technology accepted into a faction research queue
+    ResearchQueued {
+        faction_id: game_types::FactionId,
+        tech_id: game_types::TechId,
+        job_id: game_types::ResearchJobId,
+    },
+    /// Research job locked its inputs and began consuming ticks
+    ResearchStarted {
+        faction_id: game_types::FactionId,
+        tech_id: game_types::TechId,
+        job_id: game_types::ResearchJobId,
+        finish_tick: SimTick,
+    },
+    /// Research job stalled on an authoritative gate
+    ResearchBlocked {
+        faction_id: game_types::FactionId,
+        tech_id: game_types::TechId,
+        reason: ResearchBlockedReason,
+    },
+    /// Research job cancelled and its reserved inputs refunded in full
+    ResearchCancelled {
+        faction_id: game_types::FactionId,
+        tech_id: game_types::TechId,
+        job_id: game_types::ResearchJobId,
+        refunded_units: u32,
+    },
+    /// A new faction-wide modifier patch was distributed across the network
+    ModifierPatchDistributed {
+        faction_id: game_types::FactionId,
+        patch_version: u64,
+        source_count: usize,
+    },
+}
+
+/// Reason a research job cannot make progress this tick.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ResearchBlockedReason {
+    /// The faction owns no constructed research facility.
+    NoFacility,
+    /// The hosting research facility has insufficient authoritative power.
+    Unpowered,
+    /// The facility hopper lacks the authoritative material cost.
+    AwaitingResources,
 }
 
 /// Reason for production facility progress obstruction.
@@ -194,7 +291,7 @@ pub enum ProductionBlockedReason {
 }
 
 /// Event journal for replay and debugging.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventJournal {
     events: Vec<(SimTick, SimEvent)>,
     next_id: u64,

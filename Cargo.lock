@@ -3,9 +3,18 @@
 version = 4
 
 [[package]]
+name = "anti-cheat"
+version = "0.1.0"
+dependencies = [
+ "game-types",
+ "sim-core",
+]
+
+[[package]]
 name = "dedicated-server"
 version = "0.1.0"
 dependencies = [
+ "anti-cheat",
  "game-protocol",
  "game-types",
  "sim-core",
@@ -24,6 +33,7 @@ dependencies = [
 name = "game-protocol"
 version = "0.1.0"
 dependencies = [
+ "anti-cheat",
  "game-types",
  "sim-core",
 ]

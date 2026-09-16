@@ -434,3 +434,119 @@ impl fmt::Display for RouteNodeId {
         write!(f, "RouteNode({})", self.0)
     }
 }
+
+/// Unique squad identifier for deterministic robot formation groups.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct SquadId(pub u32);
+
+impl SquadId {
+    pub const fn new(value: u32) -> Self {
+        SquadId(value)
+    }
+
+    pub const fn null() -> Self {
+        SquadId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for SquadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Squad({})", self.0)
+    }
+}
+
+/// Unique technology identifier in the data-driven research tech tree.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct TechId(pub u32);
+
+impl TechId {
+    pub const fn new(value: u32) -> Self {
+        TechId(value)
+    }
+
+    pub const fn null() -> Self {
+        TechId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for TechId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Tech({})", self.0)
+    }
+}
+
+/// Unique identifier for a queued research job entry.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct ResearchJobId(pub u64);
+
+impl ResearchJobId {
+    pub const fn new(value: u64) -> Self {
+        ResearchJobId(value)
+    }
+
+    pub const fn null() -> Self {
+        ResearchJobId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ResearchJobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ResearchJob({})", self.0)
+    }
+}
+
+/// Unique robot chassis archetype identifier gated behind research unlocks.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct ChassisId(pub u32);
+
+impl ChassisId {
+    pub const fn new(value: u32) -> Self {
+        ChassisId(value)
+    }
+
+    pub const fn null() -> Self {
+        ChassisId(0)
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ChassisId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Chassis({})", self.0)
+    }
+}
