@@ -280,6 +280,17 @@ pub enum SimEvent {
         target: Option<EntityId>,
         position: (f32, f32, f32),
     },
+    /// Entity entered active sensor coverage of an observer faction
+    EntitySpotted {
+        observer_faction: game_types::FactionId,
+        target: EntityId,
+        position: (f32, f32, f32),
+    },
+    /// Entity exited active sensor coverage of an observer faction
+    EntityLost {
+        observer_faction: game_types::FactionId,
+        target: EntityId,
+    },
 }
 
 /// Reason a research job cannot make progress this tick.

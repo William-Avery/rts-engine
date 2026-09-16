@@ -69,6 +69,8 @@ pub enum ModifierKind {
     StructureIntegrity,
     /// Research progress rate.
     ResearchSpeed,
+    /// Authoritative sensor detection radius (sensors/fog, Milestone 14).
+    SensorRange,
 }
 
 /// Every modifier kind in canonical (sorted) order, for iteration and UI.
@@ -89,6 +91,7 @@ pub const ALL_MODIFIER_KINDS: &[ModifierKind] = &[
     ModifierKind::ReinforcementRate,
     ModifierKind::StructureIntegrity,
     ModifierKind::ResearchSpeed,
+    ModifierKind::SensorRange,
 ];
 
 impl ModifierKind {
@@ -111,6 +114,7 @@ impl ModifierKind {
             ModifierKind::ReinforcementRate => "Reinforcement Rate",
             ModifierKind::StructureIntegrity => "Structure Integrity",
             ModifierKind::ResearchSpeed => "Research Speed",
+            ModifierKind::SensorRange => "Sensor Range",
         }
     }
 }

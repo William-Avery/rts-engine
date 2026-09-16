@@ -223,6 +223,18 @@ impl StructureKind {
             },
         }
     }
+
+    /// Authoritative sensor detection radius in meters for this structure type.
+    pub fn sensor_radius(&self) -> f32 {
+        match self {
+            StructureKind::Turret => 50.0,
+            StructureKind::ResearchFacility => 60.0,
+            StructureKind::Depot | StructureKind::Fabricator | StructureKind::Refinery => 40.0,
+            StructureKind::Generator | StructureKind::MiningDrill | StructureKind::Battery => 30.0,
+            StructureKind::Pylon => 35.0,
+            StructureKind::Wall(_) => 20.0,
+        }
+    }
 }
 
 /// Lifecycle state machine for physical structures.
@@ -324,6 +336,20 @@ impl Structure {
     /// Checks if an industrial structure has health and electrical power to execute jobs.
     pub fn can_operate(&self) -> bool {
         self.state.is_operational() && self.is_powered()
+    }
+
+    /// Checks if this structure actively emits sensor detection coverage.
+    ///
+    /// The structure must be operational, and if it consumes electrical power
+    /// (`demand_kw > 0`), it must be powered.
+    pub fn emits_sensor_coverage(&self) -> bool {
+        if !self.state.is_operational() {
+            return false;
+        }
+        if self.kind.power_spec().demand_kw > 0 && !self.is_powered() {
+            return false;
+        }
+        true
     }
 
     /// Checks if this structure's bounding box intersects another AABB.

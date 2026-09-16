@@ -4090,4 +4090,626 @@ mod tests {
             "Identical combat battle runs must remain bit-for-bit identical"
         );
     }
+
+    // =======================================================================
+    // Milestone 14: Sensors, Faction Knowledge, Fog, and Replication Interest
+    // =======================================================================
+
+    /// M14 Proving Ground 1: Sensor coverage reveals enemy in radius; moving out loses contact.
+    #[test]
+    fn test_m14_sensor_coverage_reveals_enemy_in_radius() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+        let reg = RegionId::new(1);
+
+        // Friendly Guardsman at (0.0, 0.0, 0.0) with 45m sensor radius
+        let _scout = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        // Enemy Rifleman at (30.0, 0.0, 0.0) — distance 30m is within 45m sensor radius
+        let enemy = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Rifleman,
+                f2,
+                reg,
+                (30.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Faction 1 knows the enemy
+        assert!(
+            harness.state().faction_knows_entity(f1, enemy),
+            "Enemy within 30m of 45m sensor scout must be visible to Faction 1"
+        );
+        assert!(
+            harness
+                .state()
+                .knowledge_manager
+                .is_position_visible(f1, 30.0, 0.0),
+            "Position of enemy must be in active Visible fog state"
+        );
+
+        // Move enemy to (60.0, 0.0, 0.0) — distance 60m is outside 45m sensor radius
+        if let Some(r) = harness.state_mut().robot_registry.robots.get_mut(&enemy) {
+            r.position = (60.0, 0.0, 0.0);
+        }
+
+        harness.run_for_ticks(1);
+
+        // Faction 1 no longer has sensor contact on enemy
+        assert!(
+            !harness.state().faction_knows_entity(f1, enemy),
+            "Enemy at 60m must not be known to Faction 1 with 45m sensor"
+        );
+        assert!(
+            !harness
+                .state()
+                .knowledge_manager
+                .is_position_visible(f1, 60.0, 0.0),
+            "Position at 60m must not be Visible"
+        );
+    }
+
+    /// M14 Proving Ground 2: Fog-of-war shroud exploration and persistence.
+    #[test]
+    fn test_m14_fog_of_war_shroud_exploration_and_persistence() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let reg = RegionId::new(1);
+
+        // Shroud: Unexplored initially
+        assert_eq!(
+            harness
+                .state_mut()
+                .knowledge_manager
+                .get_or_create(f1)
+                .fog_grid
+                .position_state(100.0, 100.0),
+            crate::knowledge::KnowledgeState::Unexplored
+        );
+
+        // Scout moves to (100.0, 0.0, 100.0)
+        let scout = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (100.0, 0.0, 100.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Location is now actively Visible
+        assert_eq!(
+            harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .fog_grid
+                .position_state(100.0, 100.0),
+            crate::knowledge::KnowledgeState::Visible
+        );
+        assert!(harness.state().is_position_visible(f1, 100.0, 100.0));
+        assert!(harness.state().is_position_explored(f1, 100.0, 100.0));
+
+        // Scout teleports to (-100.0, 0.0, -100.0)
+        if let Some(r) = harness.state_mut().robot_registry.robots.get_mut(&scout) {
+            r.position = (-100.0, 0.0, -100.0);
+        }
+
+        harness.run_for_ticks(1);
+
+        // Location transitions to Explored (fog of war) - shroud is lifted forever
+        assert_eq!(
+            harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .fog_grid
+                .position_state(100.0, 100.0),
+            crate::knowledge::KnowledgeState::Explored
+        );
+        assert!(!harness.state().is_position_visible(f1, 100.0, 100.0));
+        assert!(harness.state().is_position_explored(f1, 100.0, 100.0));
+
+        // Unvisited distant cell remains Unexplored
+        assert_eq!(
+            harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .fog_grid
+                .position_state(300.0, 300.0),
+            crate::knowledge::KnowledgeState::Unexplored
+        );
+    }
+
+    /// M14 Proving Ground 3: Structure ghosts persist in fog until revisited by friendly sensors.
+    #[test]
+    fn test_m14_structure_ghosts_persist_after_losing_line_of_sight() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+        let reg = RegionId::new(1);
+
+        // Enemy builds a Turret at (50.0, 0.0, 50.0)
+        let turret_pos = (50.0, 0.0, 50.0);
+        let build_req = crate::structure::BuildRequest {
+            kind: crate::structure::StructureKind::Turret,
+            faction_id: f2,
+            region_id: reg,
+            requested_pos: turret_pos,
+            rotation_deg: 0.0,
+            player_pos: turret_pos,
+            world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+            creation_tick: SimTick::new(0),
+        };
+        let s_id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(build_req, None)
+            .unwrap();
+
+        // Mark turret as constructed
+        if let Some(s) = harness
+            .state_mut()
+            .structure_registry
+            .structures
+            .get_mut(&s_id)
+        {
+            s.state = crate::structure::StructureState::Constructed {
+                current_hp: 1500,
+                max_hp: 1500,
+            };
+        }
+
+        // Scout enters sensor range of turret
+        let scout = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (55.0, 0.0, 55.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Faction 1 spots the turret
+        assert!(harness.state().faction_knows_structure(f1, s_id));
+        let fk = harness.state().knowledge_manager.get(f1).unwrap();
+        assert!(fk.ghost_structures.contains_key(&s_id));
+        assert_eq!(fk.ghost_structures.get(&s_id).unwrap().last_seen_hp, 1500);
+
+        // Scout moves far away into the distance
+        if let Some(r) = harness.state_mut().robot_registry.robots.get_mut(&scout) {
+            r.position = (-200.0, 0.0, -200.0);
+        }
+
+        harness.run_for_ticks(1);
+
+        // Turret is no longer in active sensor vision, but ghost persists!
+        assert!(
+            !harness
+                .state()
+                .is_position_visible(f1, turret_pos.0, turret_pos.2)
+        );
+        assert!(
+            harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .ghost_structures
+                .contains_key(&s_id),
+            "Ghost must persist in fog of war after scout leaves"
+        );
+        assert!(
+            harness.state().faction_knows_structure(f1, s_id),
+            "Faction 1 still knows about the turret via remembered ghost"
+        );
+
+        // Enemy turret is destroyed while in fog
+        if let Some(s) = harness
+            .state_mut()
+            .structure_registry
+            .structures
+            .get_mut(&s_id)
+        {
+            s.state = crate::structure::StructureState::Destroyed;
+        }
+
+        harness.run_for_ticks(5);
+
+        // Ghost still persists because Faction 1 hasn't seen the site yet!
+        assert!(
+            harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .ghost_structures
+                .contains_key(&s_id),
+            "Ghost must remain while friendly sensors have not observed the destroyed site"
+        );
+
+        // Scout returns to observe the site
+        if let Some(r) = harness.state_mut().robot_registry.robots.get_mut(&scout) {
+            r.position = (50.0, 0.0, 50.0);
+        }
+
+        harness.run_for_ticks(1);
+
+        // Friendly sensors now illuminate the site and confirm the structure is gone -> ghost is purged!
+        assert!(
+            !harness
+                .state()
+                .knowledge_manager
+                .get(f1)
+                .unwrap()
+                .ghost_structures
+                .contains_key(&s_id),
+            "Ghost must be cleared once friendly sensors verify destruction"
+        );
+        assert!(
+            !harness.state().faction_knows_structure(f1, s_id),
+            "Destroyed structure is no longer known to Faction 1"
+        );
+    }
+
+    /// M14 Proving Ground 4: Research modifier SensorRange expands sensor coverage dynamically.
+    #[test]
+    fn test_m14_sensor_range_modifier_from_research_expands_coverage() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+        let reg = RegionId::new(1);
+
+        // Friendly Swarmer biped at (0.0, 0.0, 0.0) with base sensor radius 30m
+        let _scout = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Swarmer,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        // Enemy biped at (35.0, 0.0, 0.0) — distance 35m is outside base 30m
+        let enemy = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Swarmer,
+                f2,
+                reg,
+                (35.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Enemy is initially out of range
+        assert!(!harness.state().faction_knows_entity(f1, enemy));
+
+        // Inject +50% SensorRange modifier (+500 milli -> 1500 milli multiplier = 45m radius)
+        harness.state_mut().research_manager.modifiers.add_source(
+            f1,
+            game_types::TechId::new(99),
+            &[crate::modifier::Modifier::patch(
+                crate::modifier::ModifierKind::SensorRange,
+                500,
+            )],
+        );
+
+        harness.run_for_ticks(1);
+
+        // With upgraded 45m sensor radius, enemy at 35m is now revealed!
+        assert!(
+            harness.state().faction_knows_entity(f1, enemy),
+            "SensorRange research upgrade must reveal enemy within expanded radius"
+        );
+    }
+
+    /// M14 Proving Ground 5: Power consumer structure loses sensor coverage when unpowered.
+    #[test]
+    fn test_m14_structure_sensor_power_dependency() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+        let reg = RegionId::new(1);
+
+        // Build Turret (demand 50 kW) at (0.0, 0.0, 0.0) for Faction 1
+        let turret_pos = (0.0, 0.0, 0.0);
+        let build_req = crate::structure::BuildRequest {
+            kind: crate::structure::StructureKind::Turret,
+            faction_id: f1,
+            region_id: reg,
+            requested_pos: turret_pos,
+            rotation_deg: 0.0,
+            player_pos: turret_pos,
+            world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+            creation_tick: SimTick::new(0),
+        };
+        let s_id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(build_req, None)
+            .unwrap();
+
+        // Mark turret as constructed but unpowered
+        if let Some(s) = harness
+            .state_mut()
+            .structure_registry
+            .structures
+            .get_mut(&s_id)
+        {
+            s.state = crate::structure::StructureState::Constructed {
+                current_hp: 1500,
+                max_hp: 1500,
+            };
+            s.power_status = crate::power::PowerStatus::Unpowered;
+        }
+        harness
+            .state_mut()
+            .structure_registry
+            .power_network
+            .update_node_operational(s_id, true);
+
+        // Enemy biped at (35.0, 0.0, 0.0) - within turret's 50m range, outside generator's 30m range
+        let enemy = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Rifleman,
+                f2,
+                reg,
+                (35.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Unpowered turret emits no sensor coverage!
+        assert!(
+            !harness.state().faction_knows_entity(f1, enemy),
+            "Unpowered turret must not emit sensor coverage"
+        );
+
+        // Build an adjacent operational Generator at (-5.0, 0.0, 0.0) (provides 100 kW within 10m)
+        // Note: Generator sensor range is 30m; distance from generator to enemy is 40m, so only turret can reveal enemy.
+        let gen_pos = (-5.0, 0.0, 0.0);
+        let gen_req = crate::structure::BuildRequest {
+            kind: crate::structure::StructureKind::Generator,
+            faction_id: f1,
+            region_id: reg,
+            requested_pos: gen_pos,
+            rotation_deg: 0.0,
+            player_pos: gen_pos,
+            world_bounds_xz: (-500.0, 500.0, -500.0, 500.0),
+            creation_tick: SimTick::new(0),
+        };
+        let g_id = harness
+            .state_mut()
+            .structure_registry
+            .request_build(gen_req, None)
+            .unwrap();
+
+        if let Some(s) = harness
+            .state_mut()
+            .structure_registry
+            .structures
+            .get_mut(&g_id)
+        {
+            s.state = crate::structure::StructureState::Constructed {
+                current_hp: 2000,
+                max_hp: 2000,
+            };
+        }
+        harness
+            .state_mut()
+            .structure_registry
+            .power_network
+            .update_node_operational(g_id, true);
+
+        harness.run_for_ticks(1);
+
+        // Powered turret emits 50m sensor coverage, revealing enemy at 35m!
+        assert!(
+            harness.state().faction_knows_entity(f1, enemy),
+            "Powered turret must project sensor coverage and reveal enemy"
+        );
+
+        // Decommission generator to cut power to turret
+        if let Some(s) = harness
+            .state_mut()
+            .structure_registry
+            .structures
+            .get_mut(&g_id)
+        {
+            s.state = crate::structure::StructureState::Destroyed;
+        }
+        harness
+            .state_mut()
+            .structure_registry
+            .power_network
+            .remove_node(g_id);
+
+        harness.run_for_ticks(1);
+
+        // Losing power causes turret to immediately lose active sensor projection
+        assert!(
+            !harness.state().faction_knows_entity(f1, enemy),
+            "Unpowered turret must lose active sensor coverage"
+        );
+    }
+
+    /// M14 Proving Ground 6: Spotted and Lost events are authoritatively recorded in journal.
+    #[test]
+    fn test_m14_spotted_and_lost_events_are_recorded_in_journal() {
+        let mut harness = TestHarness::new();
+        let f1 = FactionId::new(1);
+        let f2 = FactionId::new(2);
+        let reg = RegionId::new(1);
+
+        let _scout = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Guardsman,
+                f1,
+                reg,
+                (0.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        let enemy = harness
+            .state_mut()
+            .spawn_robot(
+                crate::chassis::RobotChassis::Rifleman,
+                f2,
+                reg,
+                (25.0, 0.0, 0.0),
+            )
+            .unwrap();
+
+        harness.run_for_ticks(1);
+
+        // Verify EntitySpotted event
+        let spotted = harness
+            .state()
+            .event_journal
+            .events_since(SimTick::zero())
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.1,
+                    crate::event::SimEvent::EntitySpotted {
+                        observer_faction,
+                        target,
+                        ..
+                    } if *observer_faction == f1 && *target == enemy
+                )
+            });
+        assert!(
+            spotted,
+            "SimEvent::EntitySpotted must be recorded when enemy is first seen"
+        );
+
+        // Move enemy far away out of sensor range
+        if let Some(r) = harness.state_mut().robot_registry.robots.get_mut(&enemy) {
+            r.position = (150.0, 0.0, 0.0);
+        }
+
+        harness.run_for_ticks(1);
+
+        // Verify EntityLost event
+        let lost = harness
+            .state()
+            .event_journal
+            .events_since(SimTick::zero())
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.1,
+                    crate::event::SimEvent::EntityLost {
+                        observer_faction,
+                        target,
+                    } if *observer_faction == f1 && *target == enemy
+                )
+            });
+        assert!(
+            lost,
+            "SimEvent::EntityLost must be recorded when enemy exits sensor range"
+        );
+    }
+
+    /// M14 Proving Ground 7: Sensor and knowledge determinism across identical simulations.
+    #[test]
+    fn test_m14_sensor_knowledge_determinism_across_identical_simulations() {
+        fn run_sensor_sim() -> WorldState {
+            let mut harness = TestHarness::with_seed(4242);
+            let f1 = FactionId::new(1);
+            let f2 = FactionId::new(2);
+            let reg = RegionId::new(1);
+
+            let s1 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Guardsman,
+                    f1,
+                    reg,
+                    (0.0, 0.0, 0.0),
+                )
+                .unwrap();
+            let _s2 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::AntiArmor,
+                    f1,
+                    reg,
+                    (20.0, 0.0, 10.0),
+                )
+                .unwrap();
+
+            let e1 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Swarmer,
+                    f2,
+                    reg,
+                    (40.0, 0.0, 0.0),
+                )
+                .unwrap();
+            let _e2 = harness
+                .state_mut()
+                .spawn_robot(
+                    crate::chassis::RobotChassis::Charger,
+                    f2,
+                    reg,
+                    (60.0, 0.0, 50.0),
+                )
+                .unwrap();
+
+            let _ = harness.issue_robot_order(
+                s1,
+                crate::robot::RobotOrder::MoveTo {
+                    position: (50.0, 0.0, 0.0),
+                },
+            );
+            let _ = harness.issue_robot_order(
+                e1,
+                crate::robot::RobotOrder::MoveTo {
+                    position: (-20.0, 0.0, 0.0),
+                },
+            );
+
+            harness.run_for_ticks(60);
+            harness.state().clone()
+        }
+
+        let sim_a = run_sensor_sim();
+        let sim_b = run_sensor_sim();
+
+        assert_eq!(
+            sim_a.knowledge_manager, sim_b.knowledge_manager,
+            "KnowledgeManager state must be bit-identical between identical runs"
+        );
+        assert_eq!(sim_a, sim_b, "Full WorldState must remain bit-identical");
+    }
 }

@@ -223,7 +223,7 @@ For each milestone change, append:
 - Benchmarks: N/A — this milestone makes no scale claims. The null provider is a zero-sized type (`test_null_provider_is_zero_sized_and_allocation_free`) whose `inspect_command` is a constant `Verdict::Allow`, and the basic provider's clean path returns a non-allocating empty `Vec`. Existing sim-bench scenarios are unaffected because anti-cheat sits in the protocol layer, not the simulation.
 - Decisions: Decision 26 (Anti-Cheat Provider Boundary, Internal Heuristic Layer, and EOS/EAC Adapter Seam)
 - Remaining debt:
-  - **Hidden-enemy replication filtering is Milestone 14 debt.** Snapshots still replicate the existence of every entity (id, faction, region, active flag, component mask) to every session. No position, health, inventory or order state crosses the wire, so no actionable hidden state leaks, but per-faction visibility filtering of the entity list itself belongs to M14's sensor/knowledge and replication-interest system. `WorldView::faction_knows_entity` is wired, doc-commented and returns `KnowledgeQuery::Unavailable`; `detect_hidden_target_attempt` is written, tested against a simulated post-M14 world, and reports nothing today. The M14 agent only needs to override that one method.
+  - ~~**Hidden-enemy replication filtering is Milestone 14 debt.**~~ **Resolved (Milestone 14):** Snapshots now authoritatively filter entities by faction visibility (`sim_state.faction_knows_entity(session.faction_id, e.id)`). `WorldView::faction_knows_entity` is overridden on `WorldState`, and `detect_hidden_target_attempt` actively catches and rejects illegal attacks against hidden targets in fog of war.
   - **Combat detectors are partial (Milestone 13).** `WorldView::weapon_cooldown_ticks` and `WorldView::loaded_ammo` default to `None`; fire-rate falls back to a conservative 4-tick floor and ammo uses the generic `RES_AMMO` container balance rather than magazine state. Invalid *damage claims* cannot be detected because no damage command exists yet.
   - **No avatar binding (Milestone 12).** `InspectionContext::avatar_entity` is `None`, so actor-scoped detectors fall back to session-scoped tracking.
   - **No persistent ban list.** Bans are per-match and in-memory; persistence is Milestone 23.
@@ -275,3 +275,28 @@ For each milestone change, append:
   - `CombatEffect`: `DamageOverTime`, `ArmorDegradation`, `Slow`, `StunEmp`, `Knockback`, `Suppression`.
 - Remaining debt: None
 - Blockers: None
+
+### Milestone 14 — Sensors, Faction Knowledge, Fog, and Replication Interest
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/sim-core/src/knowledge.rs, crates/sim-core/src/modifier.rs, crates/sim-core/src/structure.rs, crates/sim-core/src/event.rs, crates/sim-core/src/world.rs, crates/sim-core/src/test_harness.rs, crates/anti-cheat/src/world_view.rs, crates/game-protocol/src/server.rs, crates/game-protocol/src/threaded.rs, crates/game-client/src/fog_view.rs, crates/game-client/src/lib.rs, docs/MILESTONE_STATUS.md
+- Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, and `cargo run -p sim-bench --release` all pass cleanly with zero warnings.
+- Tests: 349 tests pass across workspace (173 in sim-core, 105 in anti-cheat, 33 in game-protocol, 27 in game-client, 11 in game-types).
+- Proving Ground Scenarios:
+  - `test_m14_sensor_coverage_reveals_enemy_in_radius`: Authoritative sensor detection across units revealing enemy entities within sensor radius and hiding them outside.
+  - `test_m14_fog_of_war_shroud_exploration_and_persistence`: Fog of War 2D grid transitioning cells correctly across `Unexplored` (shroud), `Visible` (live sensor illumination), and `Explored` (fog of war).
+  - `test_m14_structure_ghosts_persist_after_losing_line_of_sight`: Enemy structures seen by sensors create remembered `StructureGhost` snapshots in fog of war; when friendly sensors revisit a razed site, the stale ghost is authoritatively purged.
+  - `test_m14_sensor_range_modifier_from_research_expands_coverage`: Sensor range research modifiers (`ModifierKind::SensorRange`) scale detection radii up in fixed-point thousandths and expand operational vision.
+  - `test_m14_structure_sensor_power_dependency`: Structures requiring electrical power (turrets, factories) only project sensor coverage when connected and powered; blackout immediately drops coverage.
+  - `test_m14_spotted_and_lost_events_are_recorded_in_journal`: First sight records `SimEvent::EntitySpotted` and vision loss records `SimEvent::EntityLost` in the event journal.
+  - `test_m14_sensor_knowledge_determinism_across_identical_simulations`: Fog coverage and faction knowledge states reproduce bit-for-bit deterministically across independent simulation runs.
+- Security & Anti-Cheat Integration:
+  - `WorldView::faction_knows_entity` is implemented on `WorldState`, returning `KnowledgeQuery::Known` for visible units, own units, and remembered structure ghosts in fog, and `KnowledgeQuery::Unknown` for unrevealed entities.
+  - Anti-cheat detector `detect_hidden_target_attempt` rejects client orders targeting hidden entities in fog.
+  - Replication interest filtering in `server.rs` and `threaded.rs` authoritatively filters entity snapshots per connected session so that hidden entities never cross the wire.
+- Client Presentation Layer:
+  - `FogViewSnapshot` in `game-client/src/fog_view.rs` provides cached 2D mini-map exploration textures, visibility queries, and fog coverage telemetry.
+- Remaining debt: None
+- Blockers: None
+

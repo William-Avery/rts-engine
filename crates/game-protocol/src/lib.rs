@@ -1321,26 +1321,24 @@ mod tests {
         server.step_tick().unwrap();
         client.poll().unwrap();
 
-        let enemy_snapshot = client
-            .replicated_entities
-            .get(&enemy)
-            .expect("entity existence is replicated today");
-
-        // No position, health, inventory or order state crosses the wire.
-        assert_eq!(
-            *enemy_snapshot,
-            EntitySnapshot::new(enemy, FactionId::new(2), RegionId::new(1), true, 0),
-            "EntitySnapshot must expose nothing beyond id/faction/region/active/flags"
+        // Milestone 14: Hidden enemy entities in fog of war are authoritatively
+        // filtered from replication snapshots and never cross the wire to the client.
+        assert!(
+            !client.replicated_entities.contains_key(&enemy),
+            "Hidden enemy entity in fog must not be replicated to the client"
         );
 
-        // The Milestone 14 knowledge hook is present and honestly reports that
-        // no knowledge system exists yet, so no detector guesses.
-        assert_eq!(
-            server
+        // Faction knowledge correctly reports the enemy is not known.
+        assert!(
+            !server
                 .sim_state
                 .faction_knows_entity(FactionId::new(1), enemy),
-            KnowledgeQuery::Unavailable,
-            "Milestone 14 must override WorldView::faction_knows_entity"
+            "Faction 1 has no sensor knowledge of enemy entity"
+        );
+        assert_eq!(
+            WorldView::faction_knows_entity(&server.sim_state, FactionId::new(1), enemy),
+            KnowledgeQuery::Unknown,
+            "WorldView reports Unknown for hidden enemy entity"
         );
     }
 

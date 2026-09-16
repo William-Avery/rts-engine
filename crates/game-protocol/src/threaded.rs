@@ -11,7 +11,7 @@ use anti_cheat::event::{SecurityEvent, SecurityEventKind};
 use anti_cheat::manifest::{BuildManifest, ServerPolicy};
 use anti_cheat::provider::{AntiCheatMode, AntiCheatProvider, InspectionContext, Verdict};
 use anti_cheat::trust::TrustLevel;
-use game_types::{PlayerId, SessionId, SimTick};
+use game_types::{FactionId, PlayerId, SessionId, SimTick};
 use sim_core::world::{SessionDirective, WorldState};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -549,16 +549,23 @@ impl ThreadedAuthoritativeServer {
                         });
                         return;
                     }
+                    let session_faction = if client_name.eq_ignore_ascii_case("observer")
+                        || client_name.eq_ignore_ascii_case("spectator")
+                    {
+                        FactionId::null()
+                    } else {
+                        DEFAULT_SESSION_FACTION
+                    };
                     security.anti_cheat.on_client_authenticated(
                         session_id,
                         player_id,
-                        DEFAULT_SESSION_FACTION,
+                        session_faction,
                         sim_state.tick,
                     );
 
                     let token = security.tokens.next_token();
                     let mut session = Session::new(session_id, client_name, sim_state.tick)
-                        .with_identity(player_id, DEFAULT_SESSION_FACTION)
+                        .with_identity(player_id, session_faction)
                         .with_binding(token, source);
                     session.activate();
                     sessions.insert(session_id, session);
@@ -742,13 +749,24 @@ impl ThreadedAuthoritativeServer {
             ));
         }
 
-        let snapshot = SnapshotEnvelope::new(sim_state.tick, entity_snapshots);
+        let full_snapshot = SnapshotEnvelope::new(sim_state.tick, entity_snapshots.clone());
         *last_broadcast_seq += 1;
         let seq = *last_broadcast_seq;
 
+        // Send to active sessions filtered by faction knowledge interest
         for (&session_id, session) in sessions {
             if session.state.is_active() {
-                let packet = Packet::new_snapshot(session_id, seq, snapshot.clone());
+                let session_snapshot = if session.faction_id.is_null() {
+                    full_snapshot.clone()
+                } else {
+                    let filtered: Vec<EntitySnapshot> = entity_snapshots
+                        .iter()
+                        .filter(|e| sim_state.faction_knows_entity(session.faction_id, e.id))
+                        .cloned()
+                        .collect();
+                    SnapshotEnvelope::new(sim_state.tick, filtered)
+                };
+                let packet = Packet::new_snapshot(session_id, seq, session_snapshot);
                 let _ = outbound_tx.send(OutboundEnvelope {
                     packet,
                     destination: session.peer_addr,

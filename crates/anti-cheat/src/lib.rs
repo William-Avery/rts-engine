@@ -170,16 +170,16 @@ mod tests {
         );
     }
 
-    /// Known debt, asserted rather than assumed: the hidden-target detector is
-    /// wired but inert until Milestone 14 provides faction knowledge.
+    /// Milestone 14 acceptance test: WorldView::faction_knows_entity authoritatively
+    /// catches and rejects attack commands against targets hidden in fog.
     #[test]
-    fn test_acceptance_hidden_target_hook_is_wired_and_inert_until_milestone_14() {
+    fn test_acceptance_hidden_target_hook_is_wired_and_active_in_milestone_14() {
         let mut sim = WorldState::new();
         let enemy = sim.create_entity(ENEMY, RegionId::new(1));
         assert_eq!(
-            sim.faction_knows_entity(OWN, enemy),
-            KnowledgeQuery::Unavailable,
-            "M14 must override WorldView::faction_knows_entity"
+            WorldView::faction_knows_entity(&sim, OWN, enemy),
+            KnowledgeQuery::Unknown,
+            "M14 overrides WorldView::faction_knows_entity to return Unknown for hidden enemies"
         );
 
         let mut p = provider();
@@ -192,7 +192,7 @@ mod tests {
             1,
             &sim,
         );
-        // Silent today: no knowledge system means no accusation.
+        // Authoritatively caught: targeting an unknown enemy in fog is rejected!
         assert_eq!(
             p.inspect_command(
                 &ctx,
@@ -201,7 +201,7 @@ mod tests {
                     target: Some(enemy),
                 }
             ),
-            Verdict::Allow
+            Verdict::Reject(EnforcementReason::HiddenTargetAttempt)
         );
 
         // With a knowledge system present the same command is caught.

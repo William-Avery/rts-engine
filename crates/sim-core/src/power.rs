@@ -294,10 +294,15 @@ impl PowerNetwork {
 
     /// Query the current authoritative power status of a structure.
     pub fn get_power_status(&self, id: StructureId) -> PowerStatus {
-        self.structure_power_status
-            .get(&id)
-            .copied()
-            .unwrap_or(PowerStatus::NotRequired)
+        if let Some(status) = self.structure_power_status.get(&id) {
+            return *status;
+        }
+        if let Some(node) = self.nodes.get(&id)
+            && node.spec.demand_kw > 0
+        {
+            return PowerStatus::Unpowered;
+        }
+        PowerStatus::NotRequired
     }
 
     /// Query the subnet ID containing a structure.
@@ -335,7 +340,6 @@ impl PowerNetwork {
                 }
             }
         }
-
         links
     }
 

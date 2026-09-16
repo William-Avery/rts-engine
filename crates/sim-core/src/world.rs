@@ -18,6 +18,7 @@ use crate::command::{CommandBuffer, CommandEnvelope};
 use crate::entity::EntityRegistry;
 use crate::event::{EventJournal, SimEvent};
 use crate::inventory::{ContainerKind, Inventory, InventoryRegistry};
+use crate::knowledge::KnowledgeManager;
 use crate::message_queue::CrossRegionRouter;
 use crate::region::{Region, RegionBounds, RegionMap, RegionState};
 use crate::research::ResearchManager;
@@ -62,6 +63,7 @@ pub struct WorldState {
     pub event_journal: EventJournal,
     pub robot_registry: RobotRegistry,
     pub research_manager: ResearchManager,
+    pub knowledge_manager: KnowledgeManager,
     pub projectiles: ProjectileRegistry,
     /// Authoritative collision world. The server clamps every accepted player
     /// position against this; the client uses the same structure to predict.
@@ -178,6 +180,7 @@ impl WorldState {
             event_journal: EventJournal::new(),
             robot_registry: RobotRegistry::new(),
             research_manager: ResearchManager::new(),
+            knowledge_manager: KnowledgeManager::new(),
             projectiles: ProjectileRegistry::new(),
             terrain: GreyboxTerrain::default(),
             movement_config: MovementConfig::default(),
@@ -206,6 +209,32 @@ impl WorldState {
     /// Owning faction of an entity, or `None` when the entity does not exist.
     pub fn entity_faction(&self, entity: EntityId) -> Option<FactionId> {
         self.entity_registry.get(entity).map(|e| e.faction_id)
+    }
+
+    /// Whether `faction` authoritatively knows about `entity` (own, visible, or ghost).
+    pub fn faction_knows_entity(&self, faction: FactionId, entity: EntityId) -> bool {
+        self.knowledge_manager.faction_knows_entity(
+            faction,
+            entity,
+            &self.entity_registry,
+            &self.structure_registry,
+        )
+    }
+
+    /// Whether `faction` authoritatively knows about `structure` (own, visible, or ghost).
+    pub fn faction_knows_structure(&self, faction: FactionId, structure: StructureId) -> bool {
+        self.knowledge_manager
+            .faction_knows_structure(faction, structure, &self.structure_registry)
+    }
+
+    /// Whether world position `(x, z)` is actively illuminated by `faction`'s sensors.
+    pub fn is_position_visible(&self, faction: FactionId, x: f32, z: f32) -> bool {
+        self.knowledge_manager.is_position_visible(faction, x, z)
+    }
+
+    /// Whether world position `(x, z)` has ever been explored by `faction`.
+    pub fn is_position_explored(&self, faction: FactionId, x: f32, z: f32) -> bool {
+        self.knowledge_manager.is_position_explored(faction, x, z)
     }
 
     /// Authorize an actor faction to act on an entity.
@@ -777,6 +806,16 @@ impl WorldState {
 
         // Advance active projectiles and resolve impacts
         self.step_projectiles();
+
+        // Advance authoritative sensor detection and update faction fog grids
+        self.knowledge_manager.step(
+            self.tick,
+            &self.robot_registry,
+            &self.structure_registry,
+            &self.entity_registry,
+            &self.research_manager,
+            &mut self.event_journal,
+        );
 
         // Run multi-rate scheduler across regions
         self.scheduler

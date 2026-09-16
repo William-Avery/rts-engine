@@ -134,6 +134,14 @@ impl WorldView for WorldState {
             .map(|inv| inv.total_quantity(resource))
     }
 
+    fn faction_knows_entity(&self, faction: FactionId, entity: EntityId) -> KnowledgeQuery {
+        if WorldState::faction_knows_entity(self, faction, entity) {
+            KnowledgeQuery::Known
+        } else {
+            KnowledgeQuery::Unknown
+        }
+    }
+
     fn weapon_cooldown_ticks(&self, actor: EntityId) -> Option<u64> {
         if let Some(weapon) = self
             .robot_registry
@@ -301,11 +309,17 @@ mod tests {
     }
 
     #[test]
-    fn test_knowledge_hook_defaults_to_unavailable_until_milestone_14() {
-        let sim = WorldState::new();
+    fn test_milestone_14_knowledge_hook_returns_authoritative_state() {
+        let mut sim = WorldState::new();
+        let own = sim.create_entity(FactionId::new(1), RegionId::new(1));
+        let enemy = sim.create_entity(FactionId::new(2), RegionId::new(1));
         assert_eq!(
-            sim.faction_knows_entity(FactionId::new(1), EntityId::new(1)),
-            KnowledgeQuery::Unavailable
+            WorldView::faction_knows_entity(&sim, FactionId::new(1), own),
+            KnowledgeQuery::Known
+        );
+        assert_eq!(
+            WorldView::faction_knows_entity(&sim, FactionId::new(1), enemy),
+            KnowledgeQuery::Unknown
         );
     }
 

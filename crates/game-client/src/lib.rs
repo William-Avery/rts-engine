@@ -1,5 +1,6 @@
 pub mod avatar;
 pub mod camera;
+pub mod fog_view;
 pub mod hud;
 pub mod input;
 pub mod interaction;
@@ -15,6 +16,7 @@ pub mod wall_batch;
 
 pub use avatar::*;
 pub use camera::*;
+pub use fog_view::*;
 pub use hud::*;
 pub use input::*;
 pub use interaction::*;
