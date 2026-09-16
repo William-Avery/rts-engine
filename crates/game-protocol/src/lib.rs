@@ -1786,4 +1786,267 @@ mod tests {
             presence.position
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase B — Transport and Protocol Robustness (B1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_b1_malformed_packet_resistance() {
+        use crate::codec::decode_packet;
+
+        // 1. Empty buffer
+        assert!(decode_packet(&[]).is_err());
+
+        // 2. Buffer smaller than header (PacketHeader::SIZE is 21)
+        assert!(decode_packet(&[0u8; 10]).is_err());
+        assert!(decode_packet(&[0u8; 20]).is_err());
+
+        // 3. Unknown packet type (valid 21-byte header, type = 250)
+        let mut bad_header = [0u8; 25];
+        bad_header[20] = 250; // invalid type
+        assert!(decode_packet(&bad_header).is_err());
+
+        // 4. Handshake packet with invalid sub-type
+        let mut bad_handshake = [0u8; 22];
+        bad_handshake[20] = 1; // Handshake type
+        bad_handshake[21] = 99; // Invalid handshake sub-type
+        assert!(decode_packet(&bad_handshake).is_err());
+
+        // 5. Command packet truncated (type = 2, missing envelope fields)
+        let mut bad_cmd = [0u8; 25];
+        bad_cmd[20] = 2; // Command type
+        assert!(decode_packet(&bad_cmd).is_err());
+
+        // 6. Snapshot packet with absurdly large count claiming more entities than buffer holds
+        let mut fake_snapshot = Vec::new();
+        fake_snapshot.extend_from_slice(&1u32.to_le_bytes()); // version
+        fake_snapshot.extend_from_slice(&1u64.to_le_bytes()); // session
+        fake_snapshot.extend_from_slice(&1u64.to_le_bytes()); // sequence
+        fake_snapshot.push(3); // Snapshot type
+        fake_snapshot.extend_from_slice(&100u64.to_le_bytes()); // tick
+        fake_snapshot.extend_from_slice(&100_000_000u32.to_le_bytes()); // 100M entity count!
+        // Decoder must return SerializationError and not panic on EOF
+        assert!(decode_packet(&fake_snapshot).is_err());
+
+        // 7. Random fuzz garbage of various lengths (1 to 256 bytes)
+        let mut rng_state: u64 = 0xdeadbeef12345678;
+        for _ in 0..100 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = ((rng_state >> 32) % 256) as usize;
+            let mut garbage = vec![0u8; len];
+            for b in garbage.iter_mut() {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *b = (rng_state >> 24) as u8;
+            }
+            // Must either parse or return Err; MUST NEVER PANIC.
+            let _ = decode_packet(&garbage);
+        }
+    }
+
+    #[test]
+    fn test_b1_threaded_server_rejects_address_spoofing_over_wire() {
+        use crate::codec::{decode_packet, encode_packet};
+        use crate::packet::Packet;
+        use crate::version::{HandshakeMessage, PROTOCOL_VERSION};
+        use game_types::SimTick;
+        use sim_core::command::{Command, CommandEnvelope};
+        use std::net::UdpSocket;
+
+        let server_transport = UdpTransport::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_transport.local_addr().unwrap();
+        let (server_tx, server_rx) = server_transport.split().unwrap();
+
+        let config = ThreadedServerConfig {
+            tick_rate_hz: 60,
+            worker_threads: 1,
+            timeout_ticks: 300,
+            ..Default::default()
+        };
+
+        let mut handle = ThreadedAuthoritativeServer::start(server_tx, server_rx, config, None);
+
+        // Honest client socket
+        let honest_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        honest_sock.set_nonblocking(true).unwrap();
+
+        // Attacker client socket
+        let attacker_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        attacker_sock.set_nonblocking(true).unwrap();
+
+        // 1. Honest sends ClientHello
+        let hello = Packet::new_handshake(
+            SessionId::null(),
+            1,
+            HandshakeMessage::ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "HonestCommander".to_string(),
+            },
+        );
+        honest_sock
+            .send_to(&encode_packet(&hello), server_addr)
+            .unwrap();
+
+        // 2. Honest receives ServerHello with session token and session_id
+        let mut buf = [0u8; 4096];
+        let start = std::time::Instant::now();
+        let (session_id, token) = loop {
+            if let Ok((n, _)) = honest_sock.recv_from(&mut buf) {
+                let pkt = decode_packet(&buf[..n]).unwrap();
+                if let PacketPayload::Handshake(HandshakeMessage::ServerHello {
+                    accepted: true,
+                    session_id,
+                    session_token,
+                    ..
+                }) = pkt.payload
+                {
+                    break (session_id, session_token);
+                }
+            }
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("Honest client timed out waiting for ServerHello");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        // 3. Attacker spoofs a command with honest's session_id and session_token from attacker_sock
+        let spoofed_cmd = Packet::new_command(
+            CommandEnvelope::new(
+                session_id,
+                2,
+                SimTick::new(1),
+                Command::Move {
+                    position: (10.0, 0.0, 10.0),
+                    velocity: (0.0, 0.0, 0.0),
+                },
+            )
+            .with_token(token),
+        );
+        attacker_sock
+            .send_to(&encode_packet(&spoofed_cmd), server_addr)
+            .unwrap();
+
+        // Allow ticks to process
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // 4. Honest sends legitimate command with sequence 2
+        let honest_cmd = Packet::new_command(
+            CommandEnvelope::new(
+                session_id,
+                2,
+                SimTick::new(1),
+                Command::Move {
+                    position: (1.0, 0.0, 1.0),
+                    velocity: (0.0, 0.0, 0.0),
+                },
+            )
+            .with_token(token),
+        );
+        honest_sock
+            .send_to(&encode_packet(&honest_cmd), server_addr)
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        handle.stop();
+        handle.join();
+    }
+
+    #[test]
+    fn test_b1_multi_client_threaded_udp_roundtrip() {
+        use crate::codec::{decode_packet, encode_packet};
+        use crate::packet::Packet;
+        use crate::version::{HandshakeMessage, PROTOCOL_VERSION};
+        use std::net::UdpSocket;
+
+        let server_transport = UdpTransport::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_transport.local_addr().unwrap();
+        let (server_tx, server_rx) = server_transport.split().unwrap();
+
+        let config = ThreadedServerConfig {
+            tick_rate_hz: 60,
+            worker_threads: 2,
+            timeout_ticks: 300,
+            ..Default::default()
+        };
+
+        let mut handle = ThreadedAuthoritativeServer::start(server_tx, server_rx, config, None);
+
+        // Client 1
+        let client1 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client1.set_nonblocking(true).unwrap();
+        let hello1_pkt = Packet::new_handshake(
+            SessionId::null(),
+            1,
+            HandshakeMessage::ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "Client1".to_string(),
+            },
+        );
+        client1
+            .send_to(&encode_packet(&hello1_pkt), server_addr)
+            .unwrap();
+
+        // Client 2
+        let client2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client2.set_nonblocking(true).unwrap();
+        let hello2_pkt = Packet::new_handshake(
+            SessionId::null(),
+            1,
+            HandshakeMessage::ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "Client2".to_string(),
+            },
+        );
+        client2
+            .send_to(&encode_packet(&hello2_pkt), server_addr)
+            .unwrap();
+
+        // Wait for both to receive their respective ServerHello responses
+        let mut buf1 = [0u8; 4096];
+        let mut buf2 = [0u8; 4096];
+        let start = std::time::Instant::now();
+        let mut sid1 = None;
+        let mut sid2 = None;
+
+        while (sid1.is_none() || sid2.is_none())
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            if sid1.is_none()
+                && let Ok((n, _)) = client1.recv_from(&mut buf1)
+                && let Ok(pkt) = decode_packet(&buf1[..n])
+                && let PacketPayload::Handshake(HandshakeMessage::ServerHello {
+                    session_id,
+                    accepted: true,
+                    ..
+                }) = pkt.payload
+            {
+                sid1 = Some(session_id);
+            }
+            if sid2.is_none()
+                && let Ok((n, _)) = client2.recv_from(&mut buf2)
+                && let Ok(pkt) = decode_packet(&buf2[..n])
+                && let PacketPayload::Handshake(HandshakeMessage::ServerHello {
+                    session_id,
+                    accepted: true,
+                    ..
+                }) = pkt.payload
+            {
+                sid2 = Some(session_id);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let s1 = sid1.expect("Client 1 handshake accepted");
+        let s2 = sid2.expect("Client 2 handshake accepted");
+        assert_ne!(s1, s2, "Clients must be assigned unique session IDs");
+
+        // Verify metrics show 2 active sessions
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let metrics = handle.metrics();
+        assert_eq!(metrics.active_sessions, 2);
+
+        handle.stop();
+        handle.join();
+    }
 }

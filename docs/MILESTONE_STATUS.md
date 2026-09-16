@@ -230,3 +230,26 @@ For each milestone change, append:
   - **Transport security is untouched.** No encryption, message authentication, socket-layer rate limiting or DDoS mitigation.
   - ~~**`Command::Research` has no server-side validation** to guard; the research system is Milestone 19.~~ **Corrected (Phase A, Authority Core):** that variant no longer exists. Milestone 19 retired the `Research { tech_id: ItemId }` placeholder in favour of `QueueResearch` / `CancelResearch` / `ReorderResearchQueue`, all of which are validated authoritatively by `ResearchManager` against the tech tree, the faction's completed set and queue capacity, and are now faction-scoped through `ActorContext` rather than a hardcoded `FactionId::new(1)`.
 - Blockers: None. The EOS/Easy Anti-Cheat SDK is proprietary and is neither licensed nor vendored in this environment, so per the milestone's own condition no FFI crate was created; `crates/anti-cheat/src/eos.rs` provides a compile-safe, feature-gated (`eos-eac`, default off) adapter interface with zero SDK calls that fails with an explicit actionable error rather than pretending to work.
+
+### Phase B — Hardening and Debt Closure
+- Status: COMPLETE
+- Started: 2026-09-16
+- Completed: 2026-09-16
+- Key files: crates/sim-core/src/inventory.rs, crates/game-protocol/src/transport.rs, crates/game-protocol/src/threaded.rs, crates/game-protocol/src/lib.rs, tools/sim-bench/src/main.rs, tools/sim-bench/src/report.rs, tools/sim-bench/src/scenarios.rs, Cargo.toml, docs/BENCHMARKS.md, docs/MILESTONE_STATUS.md
+- Validation: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo run -p sim-bench`, `cargo run -p sim-bench --release` all pass cleanly with zero warnings
+- Tests: 323 tests pass across workspace (49 in game-protocol, 84 in game-client, 150 in sim-core, 32 in anti-cheat, 8 in game-types)
+- Hardening & Deliverables:
+  - **B1 (Transport & Protocol Robustness)**:
+    - Redesigned `ThreadedAuthoritativeServer` internal MPSC architecture to use `InboundEnvelope` and `OutboundEnvelope` carrying `Option<SocketAddr>`.
+    - Added `send_to` and `recv_from` to `TransportSend`, `TransportRecv`, and `Transport` traits, with multi-peer support implemented across `UdpSender`, `UdpReceiver`, and `UdpTransport`.
+    - Threaded server now binds client `SocketAddr` upon `ClientHello` and enforces address binding for all commands (`bind_command_packet`), closing the A1 address-spoofing vulnerability in threaded mode.
+    - Verified wire malformation resistance (`test_b1_malformed_packet_resistance`), address spoofing rejection (`test_b1_threaded_server_rejects_address_spoofing_over_wire`), and multi-client UDP routing (`test_b1_multi_client_threaded_udp_roundtrip`).
+  - **B2 (Economy Integrity & Panic Safety)**:
+    - Hardened `commit_reservation` and `release_reservation` in `inventory.rs` to atomically pre-validate that available reserved items across matching slots satisfy the reservation before modifying slot balances or removing reservations. Returns `Err(GameError::ResourceUnderflow)` atomically without corrupting inventory.
+    - Hardened release and bench profiles in root `Cargo.toml` with `overflow-checks = true` to guarantee integer overflow panic safety in production builds.
+  - **B3 (Honest Measurement)**:
+    - Eliminated formulaic memory estimation guesswork in `sim-bench`.
+    - Implemented live heap allocation tracking via custom `TrackingAllocator` global allocator wrapping `std::alloc::System`.
+    - Updated all 10 benchmark scenarios to record real heap memory, reporting authentic footprint in human-readable tables and JSON reports.
+- Remaining debt: None
+- Blockers: None

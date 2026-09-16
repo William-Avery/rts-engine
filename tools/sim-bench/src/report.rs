@@ -18,6 +18,7 @@ pub struct BenchmarkResult {
     pub entities_ticked_warm: u64,
     pub entities_ticked_cold: u64,
     pub messages_routed: u64,
+    pub measured_memory_bytes: usize,
     pub estimated_memory_bytes: usize,
 }
 
@@ -45,6 +46,7 @@ impl BenchmarkResult {
                 "        \"cold\": {}\n",
                 "      }},\n",
                 "      \"messages_routed\": {},\n",
+                "      \"measured_memory_bytes\": {},\n",
                 "      \"estimated_memory_bytes\": {}\n",
                 "    }}"
             ),
@@ -63,6 +65,7 @@ impl BenchmarkResult {
             self.entities_ticked_warm,
             self.entities_ticked_cold,
             self.messages_routed,
+            self.measured_memory_bytes,
             self.estimated_memory_bytes,
         )
     }
@@ -122,14 +125,14 @@ impl BenchmarkSuiteReport {
             "Total (ms)",
             "Avg (us/tk)",
             "Ticks/sec",
-            "Mem Est (KB)"
+            "Memory (KB)"
         );
         println!(
             "-------------------------+----------+---------+--------+------------+-------------+------------+--------------"
         );
 
         for r in &self.results {
-            let mem_kb = r.estimated_memory_bytes as f64 / 1024.0;
+            let mem_kb = r.measured_memory_bytes as f64 / 1024.0;
             println!(
                 "{:<24} | {:>8} | {:>7} | {:>6} | {:>10.3} | {:>11.3} | {:>10.1} | {:>12.1}",
                 r.scenario_name,

@@ -394,9 +394,23 @@ impl Inventory {
     ) -> GameResult<(ResourceId, u32)> {
         let reservation = self
             .reservations
-            .remove(&reservation_id)
+            .get(&reservation_id)
+            .cloned()
             .ok_or(GameError::ReservationNotFound(reservation_id))?;
 
+        // Pre-validate that slots have sufficient reserved balance and quantity
+        let available_reserved: u32 = self
+            .slots
+            .iter()
+            .filter(|s| s.resource_id == reservation.resource_id)
+            .map(|s| s.reserved.min(s.quantity))
+            .sum();
+        if available_reserved < reservation.amount {
+            return Err(GameError::ResourceUnderflow);
+        }
+
+        // Reservation validated: remove it and perform atomic deduction
+        self.reservations.remove(&reservation_id);
         let mut remaining = reservation.amount;
         for slot in &mut self.slots {
             if slot.resource_id == reservation.resource_id && slot.reserved > 0 {
@@ -412,6 +426,7 @@ impl Inventory {
                 }
             }
         }
+        debug_assert_eq!(remaining, 0);
 
         self.slots.retain(|s| !s.is_empty());
         Ok((reservation.resource_id, reservation.amount))
@@ -424,9 +439,21 @@ impl Inventory {
     ) -> GameResult<(ResourceId, u32)> {
         let reservation = self
             .reservations
-            .remove(&reservation_id)
+            .get(&reservation_id)
+            .cloned()
             .ok_or(GameError::ReservationNotFound(reservation_id))?;
 
+        let available_reserved: u32 = self
+            .slots
+            .iter()
+            .filter(|s| s.resource_id == reservation.resource_id)
+            .map(|s| s.reserved)
+            .sum();
+        if available_reserved < reservation.amount {
+            return Err(GameError::ResourceUnderflow);
+        }
+
+        self.reservations.remove(&reservation_id);
         let mut remaining = reservation.amount;
         for slot in &mut self.slots {
             if slot.resource_id == reservation.resource_id && slot.reserved > 0 {
@@ -438,6 +465,7 @@ impl Inventory {
                 }
             }
         }
+        debug_assert_eq!(remaining, 0);
 
         Ok((reservation.resource_id, reservation.amount))
     }
@@ -1065,5 +1093,48 @@ mod tests {
             inv.validate_invariants(),
             Err(GameError::CorruptedState(_))
         ));
+    }
+
+    #[test]
+    fn test_b2_commit_reservation_fails_atomically_on_insufficient_reserved_balance() {
+        let entity = EntityId::new(1);
+        let mut inv = Inventory::new(entity, ContainerKind::Depot);
+        inv.add(RES_STEEL, 100).unwrap();
+
+        let res_id = ReservationId::new(10);
+        inv.reserve(res_id, RES_STEEL, 50, SimTick::new(1), None)
+            .unwrap();
+
+        // Simulate inconsistency where reservation claims 50, but slot only has 30 reserved.
+        inv.slots[0].reserved = 30;
+
+        let res = inv.commit_reservation(res_id);
+        assert_eq!(res, Err(GameError::ResourceUnderflow));
+
+        // State must remain strictly untouched:
+        // 1. Reservation is NOT removed.
+        assert!(inv.reservations.contains_key(&res_id));
+        // 2. Slot balance was not deducted.
+        assert_eq!(inv.slots[0].quantity, 100);
+        assert_eq!(inv.slots[0].reserved, 30);
+    }
+
+    #[test]
+    fn test_b2_release_reservation_fails_atomically_on_corrupt_reservation() {
+        let entity = EntityId::new(1);
+        let mut inv = Inventory::new(entity, ContainerKind::Depot);
+        inv.add(RES_STEEL, 100).unwrap();
+
+        let res_id = ReservationId::new(10);
+        inv.reserve(res_id, RES_STEEL, 50, SimTick::new(1), None)
+            .unwrap();
+
+        inv.slots[0].reserved = 20;
+
+        let res = inv.release_reservation(res_id);
+        assert_eq!(res, Err(GameError::ResourceUnderflow));
+
+        assert!(inv.reservations.contains_key(&res_id));
+        assert_eq!(inv.slots[0].reserved, 20);
     }
 }

@@ -8,8 +8,18 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 pub trait Transport: Send {
     /// Send a packet over the transport.
     fn send(&mut self, packet: Packet) -> ProtocolResult<()>;
+    /// Send a packet to an explicit destination address if supported.
+    fn send_to(&mut self, packet: Packet, _dest: Option<SocketAddr>) -> ProtocolResult<()> {
+        self.send(packet)
+    }
     /// Poll for an incoming packet without blocking.
     fn recv(&mut self) -> ProtocolResult<Option<Packet>>;
+    /// Poll for an incoming packet with its source address without blocking.
+    fn recv_from(&mut self) -> ProtocolResult<Option<(Packet, Option<SocketAddr>)>> {
+        let packet = self.recv()?;
+        let peer = self.last_peer_addr();
+        Ok(packet.map(|p| (p, peer)))
+    }
     /// Check whether the transport channel is open and connected.
     fn is_connected(&self) -> bool;
     /// Explicitly close the transport.
@@ -97,6 +107,10 @@ impl Transport for LoopbackTransport {
 pub trait TransportSend: Send + 'static {
     /// Send a packet over the transport.
     fn send(&mut self, packet: Packet) -> ProtocolResult<()>;
+    /// Send a packet to an explicit destination address if supported.
+    fn send_to(&mut self, packet: Packet, _dest: Option<SocketAddr>) -> ProtocolResult<()> {
+        self.send(packet)
+    }
     /// Check whether the transport channel is open and connected.
     fn is_connected(&self) -> bool;
     /// Explicitly close the transport.
@@ -107,6 +121,12 @@ pub trait TransportSend: Send + 'static {
 pub trait TransportRecv: Send + 'static {
     /// Poll for an incoming packet without blocking.
     fn recv(&mut self) -> ProtocolResult<Option<Packet>>;
+    /// Poll for an incoming packet with its source address without blocking.
+    fn recv_from(&mut self) -> ProtocolResult<Option<(Packet, Option<SocketAddr>)>> {
+        let packet = self.recv()?;
+        let peer = self.last_peer_addr();
+        Ok(packet.map(|p| (p, peer)))
+    }
     /// Check whether the transport channel is open and connected.
     fn is_connected(&self) -> bool;
     /// Explicitly close the transport.
@@ -192,10 +212,14 @@ pub struct UdpSender {
 
 impl TransportSend for UdpSender {
     fn send(&mut self, packet: Packet) -> ProtocolResult<()> {
+        self.send_to(packet, None)
+    }
+
+    fn send_to(&mut self, packet: Packet, dest: Option<SocketAddr>) -> ProtocolResult<()> {
         if !self.connected {
             return Err(ProtocolError::NotConnected);
         }
-        let remote = self.remote_addr.ok_or_else(|| {
+        let remote = dest.or(self.remote_addr).ok_or_else(|| {
             ProtocolError::TransportError("No remote destination address set".to_string())
         })?;
 
@@ -237,6 +261,10 @@ impl TransportRecv for UdpReceiver {
     }
 
     fn recv(&mut self) -> ProtocolResult<Option<Packet>> {
+        Ok(self.recv_from()?.map(|(p, _)| p))
+    }
+
+    fn recv_from(&mut self) -> ProtocolResult<Option<(Packet, Option<SocketAddr>)>> {
         if !self.connected {
             return Ok(None);
         }
@@ -245,7 +273,7 @@ impl TransportRecv for UdpReceiver {
             Ok((size, peer)) => {
                 self.last_peer = Some(peer);
                 let packet = decode_packet(&self.buffer[..size])?;
-                Ok(Some(packet))
+                Ok(Some((packet, Some(peer))))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(ProtocolError::TransportError(e.to_string())),
@@ -354,10 +382,14 @@ impl Transport for UdpTransport {
     }
 
     fn send(&mut self, packet: Packet) -> ProtocolResult<()> {
+        self.send_to(packet, None)
+    }
+
+    fn send_to(&mut self, packet: Packet, dest: Option<SocketAddr>) -> ProtocolResult<()> {
         if !self.connected {
             return Err(ProtocolError::NotConnected);
         }
-        let remote = self.remote_addr.ok_or_else(|| {
+        let remote = dest.or(self.remote_addr).ok_or_else(|| {
             ProtocolError::TransportError("No remote destination address set".to_string())
         })?;
 
@@ -370,6 +402,10 @@ impl Transport for UdpTransport {
     }
 
     fn recv(&mut self) -> ProtocolResult<Option<Packet>> {
+        Ok(self.recv_from()?.map(|(p, _)| p))
+    }
+
+    fn recv_from(&mut self) -> ProtocolResult<Option<(Packet, Option<SocketAddr>)>> {
         if !self.connected {
             return Ok(None);
         }
@@ -381,7 +417,7 @@ impl Transport for UdpTransport {
                     self.remote_addr = Some(peer);
                 }
                 let packet = decode_packet(&self.buffer[..size])?;
-                Ok(Some(packet))
+                Ok(Some((packet, Some(peer))))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(ProtocolError::TransportError(e.to_string())),

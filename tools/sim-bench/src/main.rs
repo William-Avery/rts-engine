@@ -2,9 +2,59 @@ mod report;
 mod scenarios;
 
 use report::{BenchmarkResult, BenchmarkSuiteReport};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+pub struct TrackingAllocator {
+    allocated: AtomicUsize,
+    deallocated: AtomicUsize,
+}
+
+impl TrackingAllocator {
+    pub const fn new() -> Self {
+        Self {
+            allocated: AtomicUsize::new(0),
+            deallocated: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn current_bytes(&self) -> usize {
+        let a = self.allocated.load(Ordering::SeqCst);
+        let d = self.deallocated.load(Ordering::SeqCst);
+        a.saturating_sub(d)
+    }
+}
+
+impl Default for TrackingAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            self.allocated.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        self.deallocated.fetch_add(layout.size(), Ordering::Relaxed);
+    }
+}
+
+#[global_allocator]
+pub static GLOBAL_ALLOCATOR: TrackingAllocator = TrackingAllocator::new();
+
+pub fn current_allocated_bytes() -> usize {
+    GLOBAL_ALLOCATOR.current_bytes()
+}
 
 fn print_usage() {
     println!("sim-bench: RTS Engine Headless Simulation Benchmark Harness");

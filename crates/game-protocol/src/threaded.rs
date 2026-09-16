@@ -23,6 +23,20 @@ use std::time::{Duration, Instant};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Inbound datagram envelope received by network ingress and forwarded to simulation tick thread.
+#[derive(Debug, Clone)]
+pub struct InboundEnvelope {
+    pub packet: Packet,
+    pub source: Option<SocketAddr>,
+}
+
+/// Outbound datagram envelope dispatched from simulation tick thread to network egress.
+#[derive(Debug, Clone)]
+pub struct OutboundEnvelope {
+    pub packet: Packet,
+    pub destination: Option<SocketAddr>,
+}
+
 /// Security state owned by the simulation thread.
 ///
 /// Bundled into one struct so the packet-processing function keeps a sane
@@ -254,8 +268,8 @@ impl ThreadedAuthoritativeServer {
 
         let worker_pool = Arc::new(WorkerPool::new(config.worker_threads));
 
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Packet>();
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Packet>();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEnvelope>();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundEnvelope>();
 
         // 1. Spawn Network Ingress Thread
         let rx_running = Arc::clone(&running);
@@ -266,14 +280,14 @@ impl ThreadedAuthoritativeServer {
                 let mut recv = receiver;
                 while rx_running.load(Ordering::Relaxed) {
                     let mut received_any = false;
-                    while let Ok(Some(packet)) = recv.recv() {
+                    while let Ok(Some((packet, source))) = recv.recv_from() {
                         received_any = true;
                         {
                             if let Ok(mut m) = rx_metrics.write() {
                                 m.packets_received += 1;
                             }
                         }
-                        if inbound_tx.send(packet).is_err() {
+                        if inbound_tx.send(InboundEnvelope { packet, source }).is_err() {
                             return; // Channel disconnected
                         }
                     }
@@ -296,8 +310,8 @@ impl ThreadedAuthoritativeServer {
                 let mut send = sender;
                 while tx_running.load(Ordering::Relaxed) {
                     match outbound_rx.recv_timeout(Duration::from_millis(10)) {
-                        Ok(packet) => {
-                            if send.send(packet).is_ok()
+                        Ok(envelope) => {
+                            if send.send_to(envelope.packet, envelope.destination).is_ok()
                                 && let Ok(mut m) = tx_metrics.write()
                             {
                                 m.packets_sent += 1;
@@ -346,9 +360,9 @@ impl ThreadedAuthoritativeServer {
                     let tick_start = Instant::now();
 
                     // Step A: Drain inbound packet queue
-                    while let Ok(packet) = inbound_rx.try_recv() {
-                        Self::process_inbound_packet(
-                            packet,
+                    while let Ok(envelope) = inbound_rx.try_recv() {
+                        Self::process_inbound_envelope(
+                            envelope,
                             &mut sim_state,
                             &mut sessions,
                             &mut next_session_id,
@@ -467,15 +481,16 @@ impl ThreadedAuthoritativeServer {
         }
     }
 
-    fn process_inbound_packet(
-        packet: Packet,
+    fn process_inbound_envelope(
+        envelope: InboundEnvelope,
         sim_state: &mut WorldState,
         sessions: &mut BTreeMap<SessionId, Session>,
         next_session_id: &mut u64,
         last_broadcast_seq: &mut u64,
-        outbound_tx: &Sender<Packet>,
+        outbound_tx: &Sender<OutboundEnvelope>,
         security: &mut ServerSecurity,
     ) {
+        let InboundEnvelope { packet, source } = envelope;
         match packet.payload {
             PacketPayload::Handshake(handshake) => match handshake {
                 HandshakeMessage::ClientHello {
@@ -497,14 +512,16 @@ impl ThreadedAuthoritativeServer {
                                 session_token: 0,
                             },
                         );
-                        let _ = outbound_tx.send(response);
+                        let _ = outbound_tx.send(OutboundEnvelope {
+                            packet: response,
+                            destination: source,
+                        });
                         return;
                     }
 
                     let session_id = SessionId::new(*next_session_id);
                     let player_id = PlayerId::new(*next_session_id as u32);
                     *next_session_id += 1;
-                    let source: Option<SocketAddr> = None;
 
                     if security
                         .anti_cheat
@@ -526,7 +543,10 @@ impl ThreadedAuthoritativeServer {
                                 session_token: 0,
                             },
                         );
-                        let _ = outbound_tx.send(response);
+                        let _ = outbound_tx.send(OutboundEnvelope {
+                            packet: response,
+                            destination: source,
+                        });
                         return;
                     }
                     security.anti_cheat.on_client_authenticated(
@@ -554,7 +574,10 @@ impl ThreadedAuthoritativeServer {
                             session_token: token,
                         },
                     );
-                    let _ = outbound_tx.send(response);
+                    let _ = outbound_tx.send(OutboundEnvelope {
+                        packet: response,
+                        destination: source,
+                    });
                 }
                 HandshakeMessage::Disconnect { session_id, .. } => {
                     if let Some(session) = sessions.get_mut(&session_id) {
@@ -573,7 +596,7 @@ impl ThreadedAuthoritativeServer {
                 // owns the session must not be able to touch its heartbeat or
                 // latch its sequence counter.
                 if let BindingOutcome::Rejected(kind) =
-                    bind_command_packet(sessions, &envelope, None)
+                    bind_command_packet(sessions, &envelope, source)
                 {
                     security.commands_blocked += 1;
                     security.anti_cheat.report_event(SecurityEvent::new(
@@ -683,13 +706,20 @@ impl ThreadedAuthoritativeServer {
             }
             PacketPayload::Ping { timestamp } => {
                 let session_id = packet.header.session_id;
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.update_heartbeat(sim_state.tick);
-                }
+                let dest = sessions
+                    .get_mut(&session_id)
+                    .map(|session| {
+                        session.update_heartbeat(sim_state.tick);
+                        session.peer_addr
+                    })
+                    .unwrap_or(source);
                 *last_broadcast_seq += 1;
                 let pong =
                     Packet::new_pong(session_id, *last_broadcast_seq, timestamp, sim_state.tick);
-                let _ = outbound_tx.send(pong);
+                let _ = outbound_tx.send(OutboundEnvelope {
+                    packet: pong,
+                    destination: dest,
+                });
             }
             _ => {}
         }
@@ -699,7 +729,7 @@ impl ThreadedAuthoritativeServer {
         sim_state: &WorldState,
         sessions: &BTreeMap<SessionId, Session>,
         last_broadcast_seq: &mut u64,
-        outbound_tx: &Sender<Packet>,
+        outbound_tx: &Sender<OutboundEnvelope>,
     ) {
         let mut entity_snapshots = Vec::new();
         for entity in sim_state.entity_registry.iter() {
@@ -719,7 +749,10 @@ impl ThreadedAuthoritativeServer {
         for (&session_id, session) in sessions {
             if session.state.is_active() {
                 let packet = Packet::new_snapshot(session_id, seq, snapshot.clone());
-                let _ = outbound_tx.send(packet);
+                let _ = outbound_tx.send(OutboundEnvelope {
+                    packet,
+                    destination: session.peer_addr,
+                });
             }
         }
     }

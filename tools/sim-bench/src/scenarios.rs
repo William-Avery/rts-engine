@@ -1,21 +1,20 @@
 use crate::report::BenchmarkResult;
 use game_types::{FactionId, RegionId, SimTick};
-use sim_core::entity::Entity;
 use sim_core::message_queue::{BackpressurePolicy, CrossRegionPayload};
 use sim_core::region::{Region, RegionBounds, RegionState};
 use sim_core::scheduler::WakeupReason;
 use sim_core::test_harness::TestHarness;
 use std::time::Instant;
 
-fn estimate_memory(entity_count: usize, region_count: usize, queue_msgs: usize) -> usize {
-    let entity_size = std::mem::size_of::<Entity>() + 48; // struct + BTreeSet node overhead
-    let region_size = std::mem::size_of::<Region>() + 64;
-    let msg_size = 64;
-    (entity_count * entity_size) + (region_count * region_size) + (queue_msgs * msg_size) + 16384
+fn sample_memory_bytes(mem_before: usize) -> usize {
+    let mem_after = crate::current_allocated_bytes();
+    let delta = mem_after.saturating_sub(mem_before);
+    if delta > 0 { delta } else { mem_after }
 }
 
 /// Scenario 1: 10,000 inert static structures (walls) in cold regions.
 pub fn scenario_10k_walls() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_walls = 10_000;
     let num_regions = 16;
@@ -71,6 +70,7 @@ pub fn scenario_10k_walls() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "10k_walls".to_string(),
         description: "10,000 inert walls in 16 cold regions".to_string(),
@@ -87,12 +87,14 @@ pub fn scenario_10k_walls() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_walls, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 2: 1,000 idle units across warm and cold regions.
 pub fn scenario_1k_idle_units() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_units = 1_000;
     let num_regions = 8;
@@ -137,6 +139,7 @@ pub fn scenario_1k_idle_units() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "1k_idle_units".to_string(),
         description: "1,000 idle units split across 4 warm and 4 cold regions".to_string(),
@@ -153,12 +156,14 @@ pub fn scenario_1k_idle_units() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_units, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 3: Hot vs Cold regions comparison with identical entity counts.
 pub fn scenario_hot_vs_cold() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let entities_per_region = 500;
     let num_entities = entities_per_region * 2;
@@ -209,6 +214,7 @@ pub fn scenario_hot_vs_cold() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "hot_vs_cold".to_string(),
         description: "500 entities in Hot vs 500 entities in Cold region".to_string(),
@@ -225,12 +231,14 @@ pub fn scenario_hot_vs_cold() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_entities, 2, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 4: Scheduled factories in cold regions waking up periodically.
 pub fn scenario_scheduled_factories() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_factories = 200;
     let ticks_to_run = 150; // 5 seconds at 30 Hz
@@ -277,6 +285,7 @@ pub fn scenario_scheduled_factories() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "scheduled_factories".to_string(),
         description: "200 factories waking up every 30 ticks in cold region".to_string(),
@@ -293,12 +302,14 @@ pub fn scenario_scheduled_factories() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_factories, 1, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 5: High-volume cross-region message routing under backpressure.
 pub fn scenario_event_queue_stress() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_regions = 16;
     let total_messages = 25_000;
@@ -368,6 +379,7 @@ pub fn scenario_event_queue_stress() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "event_queue_stress".to_string(),
         description: "25,000 cross-region messages routed across 16 regions".to_string(),
@@ -384,12 +396,14 @@ pub fn scenario_event_queue_stress() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_regions * 10, num_regions, total_messages),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 6: 1,000 power network structures (generators, pylons, batteries, turrets, fabricators) across multi-island grids.
 pub fn scenario_power_grid_1k() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_structures = 1_000;
     let num_regions = 16;
@@ -471,6 +485,7 @@ pub fn scenario_power_grid_1k() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "power_grid_1k".to_string(),
         description: "1,000 power structures across multi-island grids with battery buffering"
@@ -488,12 +503,14 @@ pub fn scenario_power_grid_1k() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 7: 1,000 industrial production structures (miners, refineries, fabricators, generators).
 pub fn scenario_production_chain_1k() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_structures = 1_000;
     let num_regions = 16;
@@ -612,6 +629,7 @@ pub fn scenario_production_chain_1k() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "production_chain_1k".to_string(),
         description:
@@ -630,12 +648,14 @@ pub fn scenario_production_chain_1k() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 8: 1,000 concurrent logistics jobs across 16 regions with depots, docks, and route graph.
 pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_jobs = 1000;
     let num_regions = 16;
@@ -785,10 +805,11 @@ pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "logistics_jobs_1k".to_string(),
         description:
-            "1,000 concurrent logistics jobs across 16 regions with 100 depots, docks, and 250 haulers"
+            "1,000 concurrent logistics jobs across 16 regions with multi-tier depots and route graph routing"
                 .to_string(),
         entity_count: num_jobs + num_depots + num_haulers,
         region_count: num_regions,
@@ -803,12 +824,14 @@ pub fn scenario_logistics_jobs_1k() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_jobs + num_depots + num_haulers, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 9: 1,000 biped robots navigating, separating, escorting, and holding formation.
 pub fn scenario_robots_1k() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_robots = 1_000;
     let num_regions = 16;
@@ -933,12 +956,13 @@ pub fn scenario_robots_1k() -> BenchmarkResult {
         0.0
     };
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "robots_1k".to_string(),
         description:
-            "1,000 biped robots across 16 regions with 8 commanders, 16 escorts, and 40 regrouping squads"
+            "1,000 biped robots across 16 hot regions with navigation, flocking separation, escort, and formation"
                 .to_string(),
-        entity_count: num_robots,
+        entity_count: num_robots + num_players,
         region_count: num_regions,
         ticks_run: ticks_to_run,
         total_duration_ms: total_ms,
@@ -951,13 +975,15 @@ pub fn scenario_robots_1k() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_robots + num_players, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
 
 /// Scenario 10: 1,000 research structures across 64 factions, with the full
 /// tech tree queued and a large faction-wide modifier evaluation sweep.
 pub fn scenario_research_modifiers_1k() -> BenchmarkResult {
+    let mem_before = crate::current_allocated_bytes();
     let mut harness = TestHarness::new();
     let num_labs = 500;
     let num_structures = num_labs * 2; // paired lab + generator
@@ -1109,6 +1135,7 @@ pub fn scenario_research_modifiers_1k() -> BenchmarkResult {
     let modifier_evals =
         modifier_eval_passes * num_factions * sim_core::modifier::ALL_MODIFIER_KINDS.len();
 
+    let memory_bytes = sample_memory_bytes(mem_before);
     BenchmarkResult {
         scenario_name: "research_modifiers_1k".to_string(),
         description: format!(
@@ -1128,6 +1155,7 @@ pub fn scenario_research_modifiers_1k() -> BenchmarkResult {
         entities_ticked_warm: metrics.entities_ticked_warm,
         entities_ticked_cold: metrics.entities_ticked_cold,
         messages_routed: metrics.cross_region_messages_processed,
-        estimated_memory_bytes: estimate_memory(num_structures, num_regions, 0),
+        measured_memory_bytes: memory_bytes,
+        estimated_memory_bytes: memory_bytes,
     }
 }
